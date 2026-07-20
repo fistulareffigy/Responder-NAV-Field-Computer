@@ -1,0 +1,7 @@
+{
+  "id": "com.achindustries.optional.deploy_cam",
+  "name": "Deploy Cam",
+  "version": "0.1.0",
+  "minimumApiVersion": 1,
+  "permissions": ["display", "wifi", "storage"]
+}

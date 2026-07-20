@@ -1,0 +1,31 @@
+.pio/
+.pio-core-local/
+.pio-riscv-toolchain/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+*.bin
+serial_*.txt
+build_*.txt
+upload_*.txt
+
+# Local credentials and user data
+tile_key.txt
+wifi_secrets.h
+sdcard/tile_key.txt
+sdcard/tiles/
+sdcard/recordings/
+sdcard/photos/
+sdcard/trips/
+sdcard/notes/
+deploy_cam_esp32cam/include/wifi_secrets.h
+
+# Development-only recovery material
+backups/
+recovery_*/
+tmp/
+external/

@@ -1,0 +1,72 @@
+name: Bug report
+description: Report a reproducible firmware, app, or hardware-integration problem
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Remove credentials, API keys, precise locations, and other private data from logs.
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware version or commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Map / GPS
+        - Wi-Fi / File Transfer
+        - MeshCore / LoRa
+        - BLE
+        - RTL-SDR
+        - ELM327
+        - Deploy Cam
+        - Media / SD card
+        - UI / navigation
+        - Build / flashing
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and connection
+      description: Include peripheral models, direct or hub connection, and power source.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      placeholder: List the exact screens, buttons, and enter/exit sequence.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: serial
+    attributes:
+      label: Sanitized serial log
+      description: Capture startup and the failure at 115200 baud, if available.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed passwords, API keys, precise location data, and other private information.
+          required: true

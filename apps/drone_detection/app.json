@@ -1,0 +1,7 @@
+{
+  "id": "com.achindustries.optional.drone_detection",
+  "name": "Drone Detection",
+  "version": "0.1.0",
+  "minimumApiVersion": 1,
+  "permissions": ["display", "input", "usb.request", "sensor.read"]
+}

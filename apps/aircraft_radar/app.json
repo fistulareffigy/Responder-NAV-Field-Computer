@@ -1,0 +1,7 @@
+{
+  "id": "com.achindustries.optional.aircraft_radar",
+  "name": "Aircraft Radar",
+  "version": "0.1.0",
+  "minimumApiVersion": 1,
+  "permissions": ["display", "usb", "wifi", "storage"]
+}

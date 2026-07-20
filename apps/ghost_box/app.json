@@ -1,0 +1,7 @@
+{
+  "id": "com.achindustries.optional.ghost_box",
+  "name": "Ghost Box",
+  "version": "0.1.0",
+  "minimumApiVersion": 1,
+  "permissions": ["display", "usb", "audio"]
+}

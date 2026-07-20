@@ -1,0 +1,4 @@
+UsbHostMsc is derived from Espressif's esp-usb usb_host_msc component.
+Copyright Espressif Systems (Shanghai) CO LTD.
+Licensed under the Apache License, Version 2.0.
+Source: https://github.com/espressif/esp-usb/tree/master/host/class/msc/usb_host_msc

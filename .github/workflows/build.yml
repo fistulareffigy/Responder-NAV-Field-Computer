@@ -1,0 +1,23 @@
+name: Build firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tab5:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install PlatformIO
+        run: pip install platformio
+      - name: Build Responder Nav
+        run: pio run -e esp32p4_pioarduino55
+      - name: Build Deploy Cam
+        working-directory: deploy_cam_esp32cam
+        run: pio run -e wrover_kit_deploy_cam

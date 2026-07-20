@@ -1,0 +1,7 @@
+{
+  "id": "com.achindustries.optional.rf_watch",
+  "name": "RF Watch",
+  "version": "0.1.0",
+  "minimumApiVersion": 1,
+  "permissions": ["display", "wifi"]
+}

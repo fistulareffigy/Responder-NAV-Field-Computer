@@ -1,0 +1,15 @@
+{
+  "id": "com.responder.example.hello",
+  "name": "HELLO",
+  "version": "0.1.0",
+  "author": "Responder SDK",
+  "description": "Minimal sample app for the Tab5 Responder Nav platform.",
+  "category": "Developer",
+  "entryPoint": "hello_responder",
+  "minimumApiVersion": 1,
+  "permissions": [
+    "display",
+    "input"
+  ],
+  "requiredDrivers": []
+}

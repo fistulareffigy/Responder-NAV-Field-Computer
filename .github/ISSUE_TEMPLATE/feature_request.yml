@@ -1,0 +1,27 @@
+name: Feature request
+description: Suggest a focused improvement or optional app
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: Describe the user need, not only the proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: resources
+    attributes:
+      label: Hardware and resource impact
+      description: Note any USB, Wi-Fi, BLE, SDR, camera, audio, memory, or background-task requirements.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria

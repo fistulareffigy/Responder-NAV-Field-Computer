@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "scripts": {
+    "design:lint": "npx -y -p @google/design.md designmd lint DESIGN.md",
+    "design:diff": "npx -y -p @google/design.md designmd diff DESIGN.md",
+    "design:export:dtcg": "npx -y -p @google/design.md designmd export --format dtcg DESIGN.md",
+    "design:export:tailwind": "npx -y -p @google/design.md designmd export --format json-tailwind DESIGN.md",
+    "design:spec": "npx -y -p @google/design.md designmd spec"
+  },
+  "devDependencies": {}
+}

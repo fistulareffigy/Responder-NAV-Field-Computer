@@ -1,0 +1,28 @@
+# Release checklist
+
+- [x] Public source copied from the active development workspace
+- [x] Development logs, recovery folders, and backups excluded
+- [x] Local toolchain path removed from `platformio.ini`
+- [x] Wi-Fi Motion excluded from the current catalog
+- [x] Real map API key excluded
+- [x] Real Deploy Cam Wi-Fi secrets excluded
+- [x] Device-only Glitch Goblin font excluded
+- [x] Fixed COM ports and personal filesystem paths excluded
+- [x] Repository and binary scanned against the development map key
+- [x] API-key keyboard input and request URLs redacted from serial diagnostics
+- [x] File Transfer protected by a rotated random session token
+- [x] Main firmware builds with `esp32p4_pioarduino55`
+- [ ] Refreshed public-only firmware flashed and hardware regression-tested on a separate public test device
+- [x] Clean build tested from the public repository
+- [x] Companion Deploy Cam firmware builds from the public repository
+- [x] Refreshed release binary SHA-256 checksums generated and verified
+- [x] Bundled third-party license notices audited and documented
+- [x] Exact resolved dependency licenses reviewed (MIT, LGPL-2.1-or-later, Apache-2.0, GPL-compatible)
+- [ ] Optional peripheral regression completed for the release candidate
+- [ ] Screenshots added
+- [x] Project license selected and added (`GPL-3.0-or-later`)
+- [x] Version file and changelog added
+- [x] Public MeshCore presets checked for private network identifiers
+- [x] About screen includes copyright, license, no-warranty, and source location
+- [x] Trademark and responsible-use notice added
+- [ ] GitHub release created with binaries and SHA-256 checksums

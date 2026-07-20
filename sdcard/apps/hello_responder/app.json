@@ -1,0 +1,9 @@
+{
+  "id": "com.achindustries.example.hello_responder",
+  "name": "Hello Responder",
+  "version": "0.1.0",
+  "minimumApiVersion": 1,
+  "permissions": [
+    "display"
+  ]
+}
