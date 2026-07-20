@@ -1,5 +1,9 @@
 # Responder NAV Field Computer
 
+![R-NAV field computer with antenna](https://github.com/user-attachments/assets/82b459ce-daed-4633-bbde-56478b900f3f)
+
+![R-NAV field computer with keyboard and display](https://github.com/user-attachments/assets/c15315cd-6a99-4f5b-b965-53c51655a46e)
+
 **Responder Nav v0.7 Beta** is an expandable, offline-capable field computer for the M5Stack Tab5. It brings navigation, off-grid communications, radio utilities, vehicle diagnostics, local file transfer, and practical field tools into one landscape terminal interface.
 
 > Beta software: test critical workflows before relying on them. Responder NAV is not emergency, life-safety, aviation, or professional vehicle-diagnostic equipment.
