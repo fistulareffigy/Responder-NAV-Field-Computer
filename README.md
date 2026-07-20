@@ -1,5 +1,7 @@
 # Responder NAV Field Computer
 
+![R-NAV field computer with keyboard and display](https://github.com/user-attachments/assets/fd9721ca-8f9b-471a-bfa4-18365bca874c)
+
 ![R-NAV field computer with antenna](https://github.com/user-attachments/assets/82b459ce-daed-4633-bbde-56478b900f3f)
 
 ![R-NAV field computer with keyboard and display](https://github.com/user-attachments/assets/c15315cd-6a99-4f5b-b965-53c51655a46e)
