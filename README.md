@@ -44,8 +44,8 @@ Core hardware:
 
 - M5Stack Tab5 and Tab5 keyboard
 - microSD card
-- M5Stack GPS module
-- Optional RAK3172 LoRa module (the included presets target the 915 MHz hardware configuration)
+- M5Stack Module GPS V2.0 w/ External Antenna (AT6668)
+- M5Stack U184-US915 LORAWAN-US915 module
 
 Optional peripherals:
 
