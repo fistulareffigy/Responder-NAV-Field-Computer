@@ -42,7 +42,7 @@ It is not intended to replace a smartphone, laptop, certified scanner, or SDR wo
 - USB ELM327 OBD-II diagnostics
 - Optional Freenove ESP32-WROVER Deploy Cam companion firmware
 
-Wi-Fi Motion and Wasteland Responder are intentionally excluded from v0.7 Beta. Hardware-dependent features vary with the exact module, USB adapter, antenna, hub, vehicle, region, and radio environment.
+Wi-Fi Motion was intentionally excluded from v0.7 Beta. Hardware-dependent features vary with the exact module, USB adapter, antenna, hub, vehicle, region, and radio environment.
 
 ## Hardware
 
