@@ -1,5 +1,15 @@
 # Changelog
 
+## Responder Nav v0.71 Beta - 2026-07-21
+
+- Fixed extended UI stalls while traveling at road speed.
+- Replaced blocking background Wi-Fi reconnect loops with asynchronous reconnect attempts.
+- Reused the PSRAM map framebuffer for GPS-follow movement instead of repeatedly decoding the full map.
+- Limited adjacent-tile prefetch work and paused it during fresh road-speed motion.
+- Added age-aware vehicle-motion handling with a short GPS dropout hold.
+- Added safe serial drive diagnostics for repeatable map-follow stress testing.
+- Verified the release build and completed 90 synthetic road-motion shifts on Tab5 hardware without a crash or heartbeat loss.
+
 ## Responder Nav v0.7 Beta - 2026-07-20
 
 - Improved the MeshCore network selector layout, added Enter-to-apply keyboard control, and replaced full-screen selection redraws with targeted row updates.
