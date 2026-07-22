@@ -3373,6 +3373,31 @@ bool isAudioRealtimeSensitive() {
          (isWaypointAppVisible(kAppRecorderIndex) && (recorderRunning || recorderTaskHandle));
 }
 
+// A fresh road-speed fix temporarily protects the foreground from operations
+// that can block for seconds (notably SD tile prefetch). Keep a short hold
+// after the last fresh speed report so a brief GPS/RMC gap while driving does
+// not immediately re-enable background work.
+static uint32_t vehicleMotionHoldUntilMs = 0;
+#if ENABLE_SERIAL_CMDS
+static int8_t vehicleMotionDebugOverride = -1;
+#endif
+
+static bool vehicleMotionActive(uint32_t now) {
+#if ENABLE_SERIAL_CMDS
+  if (vehicleMotionDebugOverride >= 0) return vehicleMotionDebugOverride != 0;
+#endif
+  constexpr float kVehicleMotionKmph = 8.0f;
+  constexpr uint32_t kFreshSpeedMaxAgeMs = 3000;
+  constexpr uint32_t kMotionHoldMs = 15000;
+  if (gps.speed.isValid() && gps.speed.age() <= kFreshSpeedMaxAgeMs &&
+      gps.speed.kmph() >= kVehicleMotionKmph) {
+    vehicleMotionHoldUntilMs = now + kMotionHoldMs;
+    return true;
+  }
+  return vehicleMotionHoldUntilMs != 0 &&
+         static_cast<int32_t>(vehicleMotionHoldUntilMs - now) > 0;
+}
+
 void stopHiddenAppWork() {
   if (!isWaypointAppVisible(kAppAudioIndex) && audioWavOpen) {
     closeAudioPlayback();
@@ -3431,7 +3456,7 @@ void updateTaskManager() {
                              (gameBoyRunning || gbaRunning);
   bool allowDownloads = !focusCameraApp && !gamePerformanceMode && !deployCamPerformanceMode &&
                         (keepDownloadsAlive || foregroundDownloadScreen || lockAllowsDownloads);
-  bool vehicleMoving = gps.speed.isValid() && gps.speed.kmph() >= 8.0f;
+  bool vehicleMoving = vehicleMotionActive(millis());
   if (vehicleMoving && screen == SCREEN_MAIN) {
     // Navigation and GPS rendering win over background tile I/O while driving.
     allowDownloads = false;
@@ -9027,6 +9052,32 @@ void autoConnectWifi() {
     }
   }
   debugPrint("WIFI: autoConnect failed saved=%u", static_cast<unsigned>(savedCredCount));
+#endif
+}
+
+// Routine recovery must never wait in the UI loop. Initial boot and explicit
+// Wi-Fi screens retain their loading UI, while background recovery starts one
+// saved credential and returns immediately.
+static size_t wifiAsyncReconnectIndex = 0;
+
+static void beginAsyncWifiReconnect() {
+#if ENABLE_WIFI
+  wifiLastAutoConnectAttemptMs = millis();
+  if (savedCredCount == 0 || wifiScanInProgress || wifiTransition) return;
+  for (size_t checked = 0; checked < savedCredCount; ++checked) {
+    size_t index = wifiAsyncReconnectIndex++ % savedCredCount;
+    if (savedCreds[index].ssid.length() == 0) continue;
+    stopWifiScan();
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.disconnect(false, false);
+    WiFi.begin(savedCreds[index].ssid.c_str(), savedCreds[index].pass.c_str());
+    wifiStatusDirty = true;
+    debugPrint("WIFI: async reconnect started index=%u/%u",
+               static_cast<unsigned>(index + 1),
+               static_cast<unsigned>(savedCredCount));
+    return;
+  }
 #endif
 }
 
@@ -16216,8 +16267,16 @@ static bool renderMapCanvasRegion(double centerLat, double centerLon, uint8_t zo
   if (updateViewState) {
     uint32_t prefetchStartMs = millis();
     uint16_t prefetched = 0;
+    // Border tiles are only an optimization. Never let them monopolize the UI
+    // thread, and skip them at road speed where the next frame may already
+    // require a different border.
+    bool skipPrefetch = vehicleMotionActive(prefetchStartMs);
+    constexpr uint16_t kMaxBorderPrefetchTiles = 3;
+    constexpr uint32_t kBorderPrefetchBudgetMs = 14;
+    bool prefetchBudgetExhausted = skipPrefetch;
     for (int ty = -1; ty <= tilesY; ++ty) {
       for (int tx = -1; tx <= tilesX; ++tx) {
+        if (prefetchBudgetExhausted) break;
         if (tx >= 0 && tx < tilesX && ty >= 0 && ty < tilesY) continue;
         int tileX = startTileX + tx;
         int tileY = startTileY + ty;
@@ -16237,7 +16296,12 @@ static bool renderMapCanvasRegion(double centerLat, double centerLon, uint8_t zo
         if (loadMapTileCacheEntry(*entry, pathBuf, zoom, wrappedX, tileY)) {
           ++prefetched;
         }
+        if (prefetched >= kMaxBorderPrefetchTiles ||
+            millis() - prefetchStartMs >= kBorderPrefetchBudgetMs) {
+          prefetchBudgetExhausted = true;
+        }
       }
+      if (prefetchBudgetExhausted) break;
     }
     if (prefetched != 0) {
       debugPrint("MAP: prefetched border tiles=%u ms=%lu", prefetched,
@@ -16639,22 +16703,54 @@ void updateMapFollow(uint32_t now) {
     mapDirty = true;
   }
 
-  int32_t markerX = mapX + mapW / 2;
-  int32_t markerY = mapY + mapH / 2;
-  mapGeoToScreen(mapTargetLat, mapTargetLon, mapCenterLat, mapCenterLon, mapZoom, markerX, markerY);
-  int16_t margin = max<int16_t>(kMapRecenterMarginPx, static_cast<int16_t>(mapMarkerSize + 12));
-  bool nearViewportEdge = markerX <= mapX + margin || markerX >= mapX + mapW - margin ||
-                          markerY <= mapY + margin || markerY >= mapY + mapH - margin;
-  if (nearViewportEdge) {
-    mapCenterLat = mapTargetLat;
-    mapCenterLon = mapTargetLon;
+  double oldCenterX = 0.0;
+  double oldCenterY = 0.0;
+  double targetX = 0.0;
+  double targetY = 0.0;
+  geoToWorldPixels(mapCenterLat, mapCenterLon, mapZoom, oldCenterX, oldCenterY);
+  geoToWorldPixels(mapTargetLat, mapTargetLon, mapZoom, targetX, targetY);
+  long scrollDxLong = lround(oldCenterX - targetX);
+  long scrollDyLong = lround(oldCenterY - targetY);
+  bool centerMovedAtLeastPixel = scrollDxLong != 0 || scrollDyLong != 0;
+
+  if (centerMovedAtLeastPixel) {
+    Rect view = mapPanViewportRect();
+    bool deltaFits = abs(scrollDxLong) < view.w && abs(scrollDyLong) < view.h &&
+                     scrollDxLong >= INT16_MIN && scrollDxLong <= INT16_MAX &&
+                     scrollDyLong >= INT16_MIN && scrollDyLong <= INT16_MAX;
+    double newCenterLat = mapTargetLat;
+    double newCenterLon = mapTargetLon;
+    uint32_t renderStartUs = micros();
+    bool accelerated = screen == SCREEN_MAIN && deltaFits &&
+                       tryAcceleratedMapPan(static_cast<int16_t>(scrollDxLong),
+                                            static_cast<int16_t>(scrollDyLong),
+                                            newCenterLat, newCenterLon);
+    mapCenterLat = newCenterLat;
+    mapCenterLon = newCenterLon;
+    mapCenterValid = true;
     lastMapFollowMs = now;
-    mapDirty = true;
-    mapOverlayDirty = false;
+    if (!accelerated) {
+      arrowBackValid = false;
+      mapDirty = true;
+      mapOverlayDirty = false;
+    }
+    uint32_t renderUs = micros() - renderStartUs;
+    if (renderUs >= 100000) {
+      debugPrint("MAP: slow follow shift dx=%ld dy=%ld accelerated=%u us=%lu",
+                 scrollDxLong, scrollDyLong, accelerated ? 1U : 0U,
+                 static_cast<unsigned long>(renderUs));
+    }
     lastMapHasFix = true;
-  } else if (!lastMapHasFix || abs(markerX - lastArrowCx) >= 2 || abs(markerY - lastArrowCy) >= 2) {
-    mapOverlayDirty = true;
-    lastMapHasFix = true;
+  } else {
+    int32_t markerX = mapX + mapW / 2;
+    int32_t markerY = mapY + mapH / 2;
+    mapGeoToScreen(mapTargetLat, mapTargetLon, mapCenterLat, mapCenterLon,
+                   mapZoom, markerX, markerY);
+    if (!lastMapHasFix || abs(markerX - lastArrowCx) >= 2 ||
+        abs(markerY - lastArrowCy) >= 2) {
+      mapOverlayDirty = true;
+      lastMapHasFix = true;
+    }
   }
   lastMapTargetSource = mapTargetSource;
 }
@@ -29748,10 +29844,10 @@ void drawAboutScreen() {
 
   M5.Display.setTextSize(kButtonTextSize);
   M5.Display.setTextColor(colors.amber, colors.black);
-  M5.Display.drawString("VERSION 0.7 BETA", versionPanel.x + 18, versionPanel.y + 16);
+  M5.Display.drawString("VERSION 0.71 BETA", versionPanel.x + 18, versionPanel.y + 16);
   M5.Display.setTextSize(kSmallTextSize);
   M5.Display.setTextColor(colors.amberDim, colors.black);
-  M5.Display.drawString("CURRENT FIRMWARE: RESPONDER NAV v0.7 BETA",
+  M5.Display.drawString("CURRENT FIRMWARE: RESPONDER NAV v0.71 BETA",
                         versionPanel.x + 18, versionPanel.y + 54);
   M5.Display.setTextColor(colors.amberDim, colors.black);
   M5.Display.drawString("GPL-3.0-OR-LATER | NO WARRANTY | SOURCE ON GITHUB",
@@ -33064,7 +33160,7 @@ void handleSerialDebugCommand(String line) {
   arg.toLowerCase();
 
   if (cmd == "help" || cmd == "?") {
-    debugPrint("DEV: commands: status | app <name> | screen <name> | press <primary|secondary|tertiary|back> | touch <x> <y> | key <mod> <hid> | gps <status|kick> | usb <status|rescan|reset|clear|boot car|boot air> | elm <connect|read|clear|status> | rtl <start|stop|cycle|pwrdiag|force|forceelm|unforce|readtest> | rf <mode|band|step|up|down>");
+    debugPrint("DEV: commands: status | app <name> | screen <name> | press <primary|secondary|tertiary|back> | touch <x> <y> | drive <on|off|auto|shift dx dy> | gps <status|kick> | usb <status|rescan|reset|clear|boot car|boot air> | elm <connect|read|clear|status> | rtl <start|stop|cycle|pwrdiag|force|forceelm|unforce|readtest> | rf <mode|band|step|up|down>");
     debugPrint("DEV: apps: menu trips calendar camera gallery weather airplanes ghost rf recorder audio lora notes car rfwatch motion blekbd games ipcams health");
     return;
   }
@@ -33459,6 +33555,42 @@ void handleSerialDebugCommand(String line) {
     } else {
       debugPrint("DEV: gps commands: status kick");
     }
+    return;
+  }
+  if (cmd == "drive") {
+    if (arg == "on") {
+      vehicleMotionDebugOverride = 1;
+    } else if (arg == "off") {
+      vehicleMotionDebugOverride = 0;
+    } else if (arg == "auto") {
+      vehicleMotionDebugOverride = -1;
+      vehicleMotionHoldUntilMs = 0;
+    } else if (arg.startsWith("shift ")) {
+      String delta = arg.substring(6);
+      int split = delta.indexOf(' ');
+      long dx = split >= 0 ? delta.substring(0, split).toInt() : delta.toInt();
+      long dy = split >= 0 ? delta.substring(split + 1).toInt() : 0;
+      double lat = mapCenterValid ? mapCenterLat : kDefaultLat;
+      double lon = mapCenterValid ? mapCenterLon : kDefaultLon;
+      double worldX = 0.0;
+      double worldY = 0.0;
+      geoToWorldPixels(lat, lon, mapZoom, worldX, worldY);
+      worldPixelsToGeo(worldX + dx, worldY + dy, mapZoom, mapTargetLat, mapTargetLon);
+      mapTargetValid = true;
+      mapTargetSource = MapTargetSource::GPS_HOLD;
+      updateMapFollow(millis());
+      debugPrint("DRIVE: synthetic map shift dx=%ld dy=%ld dirty=%u", dx, dy,
+                 mapDirty ? 1U : 0U);
+      return;
+    } else if (arg != "status" && arg.length() != 0) {
+      debugPrint("DRIVE: commands on | off | auto | shift <dx> <dy>");
+      return;
+    }
+    debugPrint("DRIVE: override=%d active=%u speed_valid=%u speed_age=%lu kmph=%.1f",
+               static_cast<int>(vehicleMotionDebugOverride),
+               vehicleMotionActive(millis()) ? 1U : 0U, gps.speed.isValid() ? 1U : 0U,
+               static_cast<unsigned long>(gps.speed.age()),
+               gps.speed.isValid() ? gps.speed.kmph() : 0.0);
     return;
   }
   if (cmd == "notes" && (arg == "test" || arg == "selftest")) {
@@ -34619,9 +34751,10 @@ void loop() {
     if (wifiEnabled && wifiAvailable && savedCredCount > 0 && currentStatus != WL_CONNECTED &&
         !wifiScanInProgress && !wifiTransition &&
         now - wifiLastAutoConnectAttemptMs >= 30000UL) {
-      debugPrint("WIFI: reconnect retry status=%d saved=%u", static_cast<int>(currentStatus),
-                 static_cast<unsigned>(savedCredCount));
-      autoConnectWifi();
+      debugPrint("WIFI: background reconnect status=%d saved=%u moving=%u",
+                 static_cast<int>(currentStatus), static_cast<unsigned>(savedCredCount),
+                 vehicleMotionActive(now) ? 1U : 0U);
+      beginAsyncWifiReconnect();
     }
     if (currentStatus == WL_CONNECTED) {
       if (wifiMotionStartPending && !wifiMotionEnabled) {

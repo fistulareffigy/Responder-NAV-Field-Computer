@@ -15,7 +15,7 @@ If you convey a compiled firmware image, provide access to the complete correspo
 
 ## No warranty
 
-Responder NAV v0.7 Beta is experimental maker firmware supplied without warranty. It is not certified emergency, life-safety, medical, aviation, navigation, cybersecurity, or automotive diagnostic equipment. Verify important information using appropriate equipment and professional procedures.
+Responder NAV v0.71 Beta is experimental maker firmware supplied without warranty. It is not certified emergency, life-safety, medical, aviation, navigation, cybersecurity, or automotive diagnostic equipment. Verify important information using appropriate equipment and professional procedures.
 
 ## Responsible operation
 

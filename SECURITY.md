@@ -33,6 +33,6 @@ and any proposed mitigation. Remove unrelated personal data from logs.
 - No Wi-Fi password, API key, SSID, user directory, fixed COM port, private key, serial log, crash dump, or development font is included in the release tree.
 - Map and location request URLs are redacted from serial diagnostics.
 - Connected and saved Wi-Fi network names, waypoint names, and precise coordinates are excluded from public-build diagnostics.
-- The Deploy Cam access point uses the documented `deploycam` setup password in v0.7 Beta. Treat it as an isolated setup network, do not expose its services to the Internet, and avoid using it for sensitive scenes.
+- The Deploy Cam access point uses the documented `deploycam` setup password in v0.71 Beta. Treat it as an isolated setup network, do not expose its services to the Internet, and avoid using it for sensitive scenes.
 - The sample `tile_key.example.txt` is a placeholder only.
 - Release binaries are published with SHA-256 checksums.

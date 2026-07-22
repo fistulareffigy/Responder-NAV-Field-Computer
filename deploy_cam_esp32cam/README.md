@@ -23,7 +23,7 @@ The camera always starts its own hotspot:
 - SSID: `DeployCam-xxxxxx`
 - Password: `deploycam`
 
-The v0.7 Beta setup password is public and is not a security boundary. Use the
+The v0.71 Beta setup password is public and is not a security boundary. Use the
 camera AP only as a local deployment link, do not expose it to the Internet,
 and do not use it where an untrusted nearby device could access sensitive video.
 - Setup URL: `http://192.168.4.1/`

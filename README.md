@@ -1,8 +1,15 @@
 # Responder NAV Field Computer
 
-**Responder Nav v0.7 Beta** is an expandable, offline-capable field computer for the M5Stack Tab5. It brings navigation, off-grid communications, radio utilities, vehicle diagnostics, local file transfer, and practical field tools into one landscape terminal interface.
+**Responder Nav v0.71 Beta** is an expandable, offline-capable field computer for the M5Stack Tab5. It brings navigation, off-grid communications, radio utilities, vehicle diagnostics, local file transfer, and practical field tools into one landscape terminal interface.
 
 > Beta software: test critical workflows before relying on them. Responder NAV is not emergency, life-safety, aviation, or professional vehicle-diagnostic equipment.
+
+## What changed in v0.71 Beta
+
+- The map remains responsive at road speed by scrolling its PSRAM framebuffer instead of repeatedly decoding the full view.
+- Background Wi-Fi recovery is asynchronous, preventing saved-network retries from freezing the interface after leaving Wi-Fi coverage.
+- Tile prefetch work is bounded and pauses while driving so navigation and input stay responsive.
+- Vehicle-motion policy now tolerates short GPS speed-data dropouts without immediately restarting background work.
 
 ## Design philosophy
 
@@ -42,7 +49,7 @@ It is not intended to replace a smartphone, laptop, certified scanner, or SDR wo
 - USB ELM327 OBD-II diagnostics
 - Optional Freenove ESP32-WROVER Deploy Cam companion firmware
 
-Wi-Fi Motion was intentionally excluded from v0.7 Beta. Hardware-dependent features vary with the exact module, USB adapter, antenna, hub, vehicle, region, and radio environment.
+Wi-Fi Motion and Wasteland Responder are intentionally excluded from v0.71 Beta. Hardware-dependent features vary with the exact module, USB adapter, antenna, hub, vehicle, region, and radio environment.
 
 ## Hardware
 
@@ -86,7 +93,7 @@ The release contains no personal SSID, Wi-Fi password, API key, private MeshCore
 
 ## Optional apps
 
-The v0.7 package system reads `/apps/<package>/app.json` manifests from the SD card to expose optional modules already compiled into the firmware. It does not load arbitrary native binaries from SD.
+The v0.71 package system reads `/apps/<package>/app.json` manifests from the SD card to expose optional modules already compiled into the firmware. It does not load arbitrary native binaries from SD.
 
 See [APP_DEVELOPMENT.md](APP_DEVELOPMENT.md) and [docs/external_app_packages.md](docs/external_app_packages.md).
 
@@ -103,7 +110,7 @@ The connection uses plain HTTP rather than TLS. Do not expose port 8080 to the I
 - `lib/` — project-local hardware libraries
 - `partitions/` — Tab5 partition layout
 - `sdcard/` — public-safe starter SD-card tree
-- `apps/` — optional v0.7 Beta app manifests ready to copy to SD
+- `apps/` — optional v0.71 Beta app manifests ready to copy to SD
 - `examples/` — app package examples
 - `deploy_cam_esp32cam/` — companion camera firmware
 - `firmware/` — versioned release images and checksums

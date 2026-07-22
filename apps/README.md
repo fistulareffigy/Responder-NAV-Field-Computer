@@ -1,7 +1,7 @@
 # Optional Responder NAV apps
 
 Copy a package folder into `/apps` on the Tab5 microSD card, then restart the
-firmware. These v0.7 Beta manifests enable modules already compiled into the
+firmware. These v0.71 Beta manifests enable modules already compiled into the
 matching firmware; they are not standalone executable binaries.
 
 - `aircraft_radar` — aircraft display using supported network or RTL-SDR sources
