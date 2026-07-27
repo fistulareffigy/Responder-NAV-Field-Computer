@@ -983,7 +983,8 @@ constexpr uint32_t kLoraP2pFrequencyHz = 915000000UL;
 constexpr uint8_t kLoraP2pSpreadingFactor = 12;
 constexpr uint16_t kLoraP2pBandwidthKhz = 250;
 constexpr uint8_t kLoraP2pCodingRate = 0;
-constexpr uint16_t kLoraP2pPreamble = 8;
+constexpr uint16_t kLoraP2pPreamble = 16;
+constexpr char kMeshCoreLoraSyncWord[] = "1424";
 constexpr uint8_t kLoraP2pPowerDbm = 20;
 struct MeshNetworkPreset {
   const char *name;
@@ -1038,6 +1039,7 @@ enum LoraView : uint8_t {
   LORA_VIEW_IDENTITY,
   LORA_VIEW_RADIO,
   LORA_VIEW_RADIO_EDIT,
+  LORA_VIEW_POWER,
   LORA_VIEW_CONTACTS,
   LORA_VIEW_TELEMETRY,
   LORA_VIEW_CONTACT_INFO,
@@ -1053,8 +1055,22 @@ uint8_t meshNetworkEditField = 0;
 int meshDiscoverSelected = 0;
 bool meshDiscoverPeerFocus = false;
 bool meshContentOnlyRedraw = false;
+uint8_t meshUnreadCount = 0;
+bool meshNotificationUiDirty = false;
+bool meshHistorySavePending = false;
+uint32_t meshHistorySaveDueMs = 0;
+bool meshAdvertPending = false;
+bool meshAdvertPendingFlood = false;
 bool meshAutoAdvert = true;
 bool meshIncludeLocation = true;
+uint8_t meshTxPowerDbm = 20;
+enum MeshTelemetryShareMode : uint8_t {
+  MESH_TELEMETRY_OFF = 0,
+  MESH_TELEMETRY_BATTERY = 1,
+  MESH_TELEMETRY_FULL = 2
+};
+uint8_t meshTelemetryShareCurrent = MESH_TELEMETRY_OFF;
+uint8_t meshTelemetryShareOther = MESH_TELEMETRY_OFF;
 String meshDeviceName = "Tab5 Responder";
 String meshShortName = "TAB5";
 String meshDeviceId = "TAB5";
@@ -1081,9 +1097,13 @@ struct MeshContact {
   double lat = 0.0;
   double lon = 0.0;
   bool hasGps = false;
+  bool showOnMap = true;
+  bool telemetryAllowed = true;
   int battery = -1;
+  float batteryVoltage = 0.0f;
   uint32_t lastSeenMs = 0;
   uint32_t lastGpsMs = 0;
+  uint32_t lastTelemetryMs = 0;
 };
 struct MeshDiscoveredContact {
   String name;
@@ -1109,10 +1129,26 @@ static bool isMeshCustomNetworkSelected() {
   return meshNetworkSelected == static_cast<int>(kMeshNetworkPresetCount);
 }
 
+static uint8_t &activeMeshTelemetryShareMode() {
+  return meshTelemetryShareCurrent;
+}
+
+static const char *meshTelemetryShareModeName(uint8_t mode) {
+  switch (mode) {
+    case MESH_TELEMETRY_BATTERY: return "BATTERY ONLY";
+    case MESH_TELEMETRY_FULL: return "FULL";
+    default: return "OFF";
+  }
+}
+
 static MeshNetworkPreset activeMeshNetworkPreset() {
-  if (isMeshCustomNetworkSelected()) return meshCustomNetwork;
-  int idx = max<int>(0, min<int>(meshNetworkSelected, static_cast<int>(kMeshNetworkPresetCount) - 1));
-  return kMeshNetworkPresets[idx];
+  MeshNetworkPreset preset = meshCustomNetwork;
+  if (!isMeshCustomNetworkSelected()) {
+    int idx = max<int>(0, min<int>(meshNetworkSelected, static_cast<int>(kMeshNetworkPresetCount) - 1));
+    preset = kMeshNetworkPresets[idx];
+  }
+  preset.powerDbm = meshTxPowerDbm;
+  return preset;
 }
 String notesText;
 size_t notesCursor = 0;
@@ -2015,6 +2051,7 @@ void drawLoraApp();
 static int meshSelectionForView(LoraView view);
 static bool drawMeshSelectionDelta(LoraView view, int oldSelection, int newSelection,
                                    bool oldPeerFocus, bool newPeerFocus);
+static bool drawMeshTextInputDelta(LoraView view);
 void handleLoraAppTouch(int16_t x, int16_t y);
 static void saveMeshSettings();
 static void applyMeshIdentitySelection();
@@ -2023,6 +2060,8 @@ static void addManualMeshContact();
 static void renameSelectedMeshContact();
 static void deleteSelectedMeshContact();
 static bool addDiscoveredMeshContact(int index);
+static bool requestSelectedMeshTelemetry();
+static void toggleSelectedMeshContactMap();
 static void activateMeshMenuItem();
 static void activateMeshDiscoverItem();
 static void clearLoraMessages();
@@ -2651,6 +2690,8 @@ int lastRedrawTileX = 0x7fffffff;
 int lastRedrawTileY = 0x7fffffff;
 bool lastRedrawNearEdge = false;
 bool mapOverlayDirty = true;
+bool meshMapMarkerDirty = false;
+Rect meshMapMarkerDirtyRect = {0, 0, 0, 0};
 float lastArrowHeadingDrawn = 0.0f;
 bool lastArrowHeadingDrawnValid = false;
 int16_t lastArrowCx = 0;
@@ -13807,7 +13848,8 @@ static void handleTab5KeyboardHid(uint8_t modifier, uint8_t keycode) {
         loraView = LORA_VIEW_MESSAGES;
         loraInput = "";
         waypointsDirty = true;
-      } else if (loraView == LORA_VIEW_CONTACT_INFO) {
+      } else if (loraView == LORA_VIEW_CONTACT_INFO ||
+                 loraView == LORA_VIEW_TELEMETRY) {
         loraView = LORA_VIEW_CONTACTS;
         loraInput = "";
         waypointsDirty = true;
@@ -13820,11 +13862,11 @@ static void handleTab5KeyboardHid(uint8_t modifier, uint8_t keycode) {
       return;
     }
     if (keycode == 0x51 && loraView == LORA_VIEW_MESSAGES) {
-      if (meshChatSelected + 1 < static_cast<int>(meshContactCount)) ++meshChatSelected;
+      if (meshChatSelected < static_cast<int>(meshContactCount)) ++meshChatSelected;
     } else if (keycode == 0x52 && loraView == LORA_VIEW_MESSAGES) {
       if (meshChatSelected > -1) --meshChatSelected;
     } else if (keycode == 0x51 && loraView == LORA_VIEW_MENU) {
-      if (meshMenuSelected < 4) ++meshMenuSelected;
+      if (meshMenuSelected < 5) ++meshMenuSelected;
     } else if (keycode == 0x52 && loraView == LORA_VIEW_MENU) {
       if (meshMenuSelected > 0) --meshMenuSelected;
     } else if (keycode == 0x4F && loraView == LORA_VIEW_MENU) {
@@ -13870,6 +13912,16 @@ static void handleTab5KeyboardHid(uint8_t modifier, uint8_t keycode) {
     } else if (keycode == 0x4F && loraView == LORA_VIEW_RADIO_EDIT) {
       applyMeshNetworkEditField();
       return;
+    } else if (keycode == 0x50 && loraView == LORA_VIEW_POWER) {
+      meshTxPowerDbm = static_cast<uint8_t>(max<int>(5, meshTxPowerDbm - 1));
+      meshContentOnlyRedraw = true;
+      waypointsDirty = true;
+      return;
+    } else if (keycode == 0x4F && loraView == LORA_VIEW_POWER) {
+      meshTxPowerDbm = static_cast<uint8_t>(min<int>(22, meshTxPowerDbm + 1));
+      meshContentOnlyRedraw = true;
+      waypointsDirty = true;
+      return;
     } else if (keycode == 0x51 && (loraView == LORA_VIEW_CONTACTS || loraView == LORA_VIEW_TELEMETRY)) {
       if (meshContactSelected + 1 < static_cast<int>(meshContactCount)) ++meshContactSelected;
     } else if (keycode == 0x52 && (loraView == LORA_VIEW_CONTACTS || loraView == LORA_VIEW_TELEMETRY)) {
@@ -13886,16 +13938,16 @@ static void handleTab5KeyboardHid(uint8_t modifier, uint8_t keycode) {
       loraInput = "";
       return;
     } else if (keycode == 0x51 && loraView == LORA_VIEW_IDENTITY) {
-      meshIdentityField = static_cast<uint8_t>((meshIdentityField + 1) % 5);
+      meshIdentityField = static_cast<uint8_t>((meshIdentityField + 1) % 6);
       loraInput = "";
     } else if (keycode == 0x52 && loraView == LORA_VIEW_IDENTITY) {
-      meshIdentityField = meshIdentityField == 0 ? 4 : static_cast<uint8_t>(meshIdentityField - 1);
+      meshIdentityField = meshIdentityField == 0 ? 5 : static_cast<uint8_t>(meshIdentityField - 1);
       loraInput = "";
     } else if (keycode == 0x4F && loraView == LORA_VIEW_IDENTITY) {
       applyMeshIdentitySelection();
       return;
     } else if (keycode == 0x50 && loraView == LORA_VIEW_IDENTITY) {
-      meshIdentityField = meshIdentityField == 0 ? 4 : static_cast<uint8_t>(meshIdentityField - 1);
+      meshIdentityField = meshIdentityField == 0 ? 5 : static_cast<uint8_t>(meshIdentityField - 1);
       loraInput = "";
     } else if (keycode == 0x4C && loraView == LORA_VIEW_CONTACTS && loraInput.length() == 0) {
       deleteSelectedMeshContact();
@@ -13904,7 +13956,15 @@ static void handleTab5KeyboardHid(uint8_t modifier, uint8_t keycode) {
         loraInput.remove(loraInput.length() - 1);
       }
     } else if (keycode == 0x28) {
-      if (loraView == LORA_VIEW_MESSAGES) sendLoraTextMessage();
+      if (loraView == LORA_VIEW_MESSAGES) {
+        if (meshChatSelected == static_cast<int>(meshContactCount) &&
+            loraInput.length() == 0) {
+          loraView = LORA_VIEW_DISCOVER;
+          meshDiscoverPeerFocus = meshDiscoveredCount > 0;
+        } else {
+          sendLoraTextMessage();
+        }
+      }
       else if (loraView == LORA_VIEW_MENU) activateMeshMenuItem();
       else if (loraView == LORA_VIEW_IDENTITY) {
         applyMeshIdentitySelection();
@@ -13919,6 +13979,14 @@ static void handleTab5KeyboardHid(uint8_t modifier, uint8_t keycode) {
         }
       } else if (loraView == LORA_VIEW_RADIO_EDIT) {
         applyMeshNetworkEditField();
+      } else if (loraView == LORA_VIEW_POWER) {
+        saveMeshSettings();
+        beginLoraP2pConfiguration();
+        loraStatus = "TX POWER SAVED";
+      } else if (loraView == LORA_VIEW_CONTACT_INFO) {
+        if (requestSelectedMeshTelemetry()) loraView = LORA_VIEW_TELEMETRY;
+      } else if (loraView == LORA_VIEW_TELEMETRY) {
+        requestSelectedMeshTelemetry();
       } else if (loraView == LORA_VIEW_CONTACTS) {
         if (loraInput.length() > 0) renameSelectedMeshContact();
         else if (meshContactSelected >= 0 && meshContactSelected < static_cast<int>(meshContactCount)) {
@@ -13952,11 +14020,19 @@ static void handleTab5KeyboardHid(uint8_t modifier, uint8_t keycode) {
         debugPrint("MESHCORE: selection content redraw view=%u old=%d new=%d",
                    static_cast<unsigned>(loraView), meshOldSelection, meshNewSelection);
       } else {
+        meshContentOnlyRedraw = false;
+        waypointsDirty = false;
         debugPrint("MESHCORE: selection delta view=%u old=%d new=%d",
                    static_cast<unsigned>(loraView), meshOldSelection, meshNewSelection);
       }
     } else if (!selectionKey) {
-      waypointsDirty = true;
+      if (loraView == meshOldView && drawMeshTextInputDelta(loraView)) {
+        meshContentOnlyRedraw = false;
+        waypointsDirty = false;
+      } else {
+        meshContentOnlyRedraw = true;
+        waypointsDirty = true;
+      }
     }
     return;
   }
@@ -14161,23 +14237,15 @@ static void clearLoraMessages() {
   prefs.putUChar("mesh_hc", 0);
   prefs.putUChar("mesh_lc", 0);
   prefs.end();
+  meshHistorySavePending = false;
+  meshHistorySaveDueMs = 0;
   if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex) {
+    meshContentOnlyRedraw = true;
     waypointsDirty = true;
   }
 }
 
-static void addLoraMessage(const String &message) {
-  if (message.length() == 0) {
-    return;
-  }
-  if (loraMessageCount < kLoraMessageCount) {
-    loraMessages[loraMessageCount++] = message;
-  } else {
-    for (size_t i = 1; i < kLoraMessageCount; ++i) {
-      loraMessages[i - 1] = loraMessages[i];
-    }
-    loraMessages[kLoraMessageCount - 1] = message;
-  }
+static void persistLoraMessageHistory() {
   prefs.begin("responder", false);
   prefs.putUChar("mesh_lc", static_cast<uint8_t>(loraMessageCount));
   for (size_t i = 0; i < kLoraMessageCount; ++i) {
@@ -14201,9 +14269,45 @@ static void addLoraMessage(const String &message) {
     snprintf(key, sizeof(key), "mesh_p%un", static_cast<unsigned>(i)); prefs.putString(key, record.snr);
   }
   prefs.end();
-  if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex) {
-    waypointsDirty = true;
+  meshHistorySavePending = false;
+  meshHistorySaveDueMs = 0;
+  debugPrint("MESHCORE: history saved messages=%u packets=%u",
+             static_cast<unsigned>(loraMessageCount),
+             static_cast<unsigned>(meshPacketCount));
+}
+
+static void scheduleLoraMessageHistorySave() {
+  meshHistorySavePending = true;
+  meshHistorySaveDueMs = millis() + 3000U;
+}
+
+static void serviceLoraMessageHistorySave(uint32_t now) {
+  if (!meshHistorySavePending ||
+      static_cast<int32_t>(now - meshHistorySaveDueMs) < 0) {
+    return;
   }
+  // Preferences commits stop the flash cache repeatedly. On the Tab5 RGB panel
+  // that can starve display refresh and appear as a full-screen blue flash.
+  // Keep all receive/send hot paths RAM-only and flush while the display is off.
+  if (!screenDimmed || dimWakePrompt) {
+    return;
+  }
+  persistLoraMessageHistory();
+}
+
+static void addLoraMessage(const String &message) {
+  if (message.length() == 0) {
+    return;
+  }
+  if (loraMessageCount < kLoraMessageCount) {
+    loraMessages[loraMessageCount++] = message;
+  } else {
+    for (size_t i = 1; i < kLoraMessageCount; ++i) {
+      loraMessages[i - 1] = loraMessages[i];
+    }
+    loraMessages[kLoraMessageCount - 1] = message;
+  }
+  scheduleLoraMessageHistorySave();
 }
 
 static void loadLoraMessageHistory() {
@@ -14403,9 +14507,13 @@ static int ensureMeshContact(const String &deviceId, const String &fallbackName)
   contact.lastRssi = "";
   contact.lastSnr = "";
   contact.hasGps = false;
+  contact.showOnMap = true;
+  contact.telemetryAllowed = true;
   contact.battery = -1;
+  contact.batteryVoltage = 0.0f;
   contact.lastSeenMs = 0;
   contact.lastGpsMs = 0;
+  contact.lastTelemetryMs = 0;
   return static_cast<int>(meshContactCount++);
 }
 
@@ -14466,17 +14574,26 @@ static void rememberMeshDiscoveredContact(const String &deviceId, const String &
   peer.lastSeenMs = millis();
   peer.lastRssi = rssi;
   peer.lastSnr = snr;
+  const bool positionChanged =
+      hasGps && (!peer.hasGps || fabs(peer.lat - lat) > 0.00001 ||
+                 fabs(peer.lon - lon) > 0.00001);
   peer.hasGps = hasGps;
   if (hasGps) {
     peer.lat = lat;
     peer.lon = lon;
-    mapOverlayDirty = true;
-    responderDirty = true;
+    if (positionChanged) {
+      mapOverlayDirty = true;
+      responderDirty = true;
+    }
   }
   if (meshContactSelected >= static_cast<int>(meshDiscoveredCount)) {
     meshContactSelected = meshDiscoveredCount == 0 ? 0 : static_cast<int>(meshDiscoveredCount) - 1;
   }
-  waypointsDirty = true;
+  if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex &&
+      loraView == LORA_VIEW_DISCOVER) {
+    meshContentOnlyRedraw = true;
+    waypointsDirty = true;
+  }
 }
 
 static bool addDiscoveredMeshContact(int index) {
@@ -14512,7 +14629,8 @@ static bool addDiscoveredMeshContact(int index) {
 }
 
 static void updateMeshContactTelemetry(int idx, double lat, double lon, bool hasGps, int battery,
-                                       const String &rssi, const String &snr) {
+                                       float batteryVoltage, const String &rssi,
+                                       const String &snr) {
   if (idx < 0 || idx >= static_cast<int>(meshContactCount)) return;
   MeshContact &contact = meshContacts[idx];
   bool shouldPersist = false;
@@ -14528,25 +14646,59 @@ static void updateMeshContactTelemetry(int idx, double lat, double lon, bool has
     contact.lon = lon;
     contact.hasGps = true;
     contact.lastGpsMs = millis();
-    if (!hadGps || fabs(oldLat - lat) > 0.00001 || fabs(oldLon - lon) > 0.00001) {
+    const bool positionChanged =
+        !hadGps || fabs(oldLat - lat) > 0.00001 || fabs(oldLon - lon) > 0.00001;
+    if (positionChanged) {
       shouldPersist = true;
+      if (screen == SCREEN_MAIN && mapViewMode == MapViewMode::NAV) {
+        double centerLat = 0.0;
+        double centerLon = 0.0;
+        if (getMapCenter(centerLat, centerLon)) {
+          auto includeMarker = [&](double markerLat, double markerLon) {
+            int32_t sx = 0;
+            int32_t sy = 0;
+            if (!mapGeoToScreen(markerLat, markerLon, centerLat, centerLon,
+                                mapZoom, sx, sy)) {
+              return;
+            }
+            if (sx < mapX - 250 || sx > mapX + mapW + 20 ||
+                sy < mapY - 40 || sy > mapY + mapH + 40) {
+              return;
+            }
+            Rect markerRect = {
+                static_cast<int16_t>(sx - 14), static_cast<int16_t>(sy - 14),
+                250, 32};
+            markerRect = clampRectToMap(markerRect);
+            if (!isRectValid(markerRect)) return;
+            if (meshMapMarkerDirty) {
+              meshMapMarkerDirtyRect = unionRect(meshMapMarkerDirtyRect, markerRect);
+            } else {
+              meshMapMarkerDirtyRect = markerRect;
+              meshMapMarkerDirty = true;
+            }
+          };
+          if (hadGps) includeMarker(oldLat, oldLon);
+          includeMarker(lat, lon);
+        }
+      }
+      mapOverlayDirty = true;
+      responderDirty = true;
     }
-    mapDirty = true;
-    mapOverlayDirty = true;
-    responderDirty = true;
   }
   if (battery >= 0 && contact.battery != battery) {
     contact.battery = battery;
     shouldPersist = true;
   }
+  if (batteryVoltage > 0.0f && fabsf(contact.batteryVoltage - batteryVoltage) > 0.005f) {
+    contact.batteryVoltage = batteryVoltage;
+    shouldPersist = true;
+  }
+  contact.lastTelemetryMs = millis();
   static uint32_t lastTelemetrySaveMs = 0;
   uint32_t now = millis();
   if (shouldPersist && (lastTelemetrySaveMs == 0 || now - lastTelemetrySaveMs > 30000U)) {
     saveMeshSettings();
     lastTelemetrySaveMs = now;
-  }
-  if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex) {
-    waypointsDirty = true;
   }
 }
 
@@ -14605,6 +14757,20 @@ static void addMeshPacketRecord(const MeshPacketRecord &record) {
     if (record.detail.length()) line += " (" + record.detail + ")";
   }
   addLoraMessage(line);
+  if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex) {
+    meshContentOnlyRedraw = true;
+    waypointsDirty = true;
+  }
+}
+
+static void noteMeshUnreadMessage() {
+  const bool readingChat =
+      screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex &&
+      loraView == LORA_VIEW_MESSAGES && !screenDimmed;
+  if (readingChat) return;
+  if (meshUnreadCount < 99) ++meshUnreadCount;
+  meshNotificationUiDirty = true;
+  mainNavDirty = true;
 }
 
 static void refreshMeshExportText() {
@@ -14625,6 +14791,14 @@ static void loadMeshSettings() {
   meshAutoAdvert = prefs.getBool("mesh_adv", meshAutoAdvert);
   bool meshLocMigrated = prefs.getBool("mesh_loc_v2", false);
   meshIncludeLocation = meshLocMigrated ? prefs.getBool("mesh_loc", meshIncludeLocation) : true;
+  meshTxPowerDbm = static_cast<uint8_t>(
+      max<int>(5, min<int>(22, prefs.getUChar("mesh_power", meshTxPowerDbm))));
+  meshTelemetryShareCurrent = static_cast<uint8_t>(
+      min<int>(MESH_TELEMETRY_FULL,
+               prefs.getUChar("mesh_tshare", MESH_TELEMETRY_OFF)));
+  meshTelemetryShareOther = static_cast<uint8_t>(
+      min<int>(MESH_TELEMETRY_FULL,
+               prefs.getUChar("mesh_tother", MESH_TELEMETRY_OFF)));
   if (!meshLocMigrated) {
     prefs.putBool("mesh_loc", meshIncludeLocation);
     prefs.putBool("mesh_loc_v2", true);
@@ -14667,6 +14841,13 @@ static void loadMeshSettings() {
     }
     snprintf(key, sizeof(key), "mc%ub", static_cast<unsigned>(i));
     meshContacts[i].battery = prefs.getInt(key, -1);
+    snprintf(key, sizeof(key), "mc%uv", static_cast<unsigned>(i));
+    meshContacts[i].batteryVoltage =
+        static_cast<float>(prefs.getInt(key, 0)) / 1000.0f;
+    snprintf(key, sizeof(key), "mc%um", static_cast<unsigned>(i));
+    meshContacts[i].showOnMap = prefs.getBool(key, true);
+    snprintf(key, sizeof(key), "mc%ut", static_cast<unsigned>(i));
+    meshContacts[i].telemetryAllowed = prefs.getBool(key, true);
     snprintf(key, sizeof(key), "mc%ur", static_cast<unsigned>(i));
     meshContacts[i].lastRssi = prefs.getString(key, "");
     snprintf(key, sizeof(key), "mc%uq", static_cast<unsigned>(i));
@@ -14687,6 +14868,9 @@ static void saveMeshSettings() {
   prefs.putBool("mesh_adv", meshAutoAdvert);
   prefs.putBool("mesh_loc", meshIncludeLocation);
   prefs.putBool("mesh_loc_v2", true);
+  prefs.putUChar("mesh_power", meshTxPowerDbm);
+  prefs.putUChar("mesh_tshare", meshTelemetryShareCurrent);
+  prefs.putUChar("mesh_tother", meshTelemetryShareOther);
   prefs.putInt("mesh_net", meshNetworkSelected);
   prefs.putBool("mesh_cust_en", meshCustomNetworkEnabled);
   prefs.putUInt("mesh_cfreq", meshCustomNetwork.frequencyHz);
@@ -14717,6 +14901,14 @@ static void saveMeshSettings() {
                           : 0);
     snprintf(key, sizeof(key), "mc%ub", static_cast<unsigned>(i));
     prefs.putInt(key, i < meshContactCount ? meshContacts[i].battery : -1);
+    snprintf(key, sizeof(key), "mc%uv", static_cast<unsigned>(i));
+    prefs.putInt(key, i < meshContactCount
+                          ? static_cast<int>(meshContacts[i].batteryVoltage * 1000.0f)
+                          : 0);
+    snprintf(key, sizeof(key), "mc%um", static_cast<unsigned>(i));
+    prefs.putBool(key, i < meshContactCount ? meshContacts[i].showOnMap : false);
+    snprintf(key, sizeof(key), "mc%ut", static_cast<unsigned>(i));
+    prefs.putBool(key, i < meshContactCount ? meshContacts[i].telemetryAllowed : false);
     snprintf(key, sizeof(key), "mc%ur", static_cast<unsigned>(i));
     prefs.putString(key, i < meshContactCount ? meshContacts[i].lastRssi : "");
     snprintf(key, sizeof(key), "mc%uq", static_cast<unsigned>(i));
@@ -14737,6 +14929,9 @@ static void applyMeshIdentitySelection() {
     meshAutoAdvert = !meshAutoAdvert;
   } else if (meshIdentityField == 4) {
     meshIncludeLocation = !meshIncludeLocation;
+  } else if (meshIdentityField == 5) {
+    uint8_t &mode = activeMeshTelemetryShareMode();
+    mode = static_cast<uint8_t>((mode + 1) % 3);
   }
   loraInput = "";
   saveMeshSettings();
@@ -14760,7 +14955,8 @@ static void applyMeshNetworkEditField() {
     } else if (meshNetworkEditField == 3) {
       meshCustomNetwork.bandwidthKhz = static_cast<uint16_t>(max<int>(7, min<int>(500, loraInput.toInt())));
     } else if (meshNetworkEditField == 4) {
-      meshCustomNetwork.powerDbm = static_cast<uint8_t>(max<int>(0, min<int>(22, loraInput.toInt())));
+      meshTxPowerDbm = static_cast<uint8_t>(max<int>(5, min<int>(22, loraInput.toInt())));
+      meshCustomNetwork.powerDbm = meshTxPowerDbm;
     }
   }
   meshCustomNetwork.moduleCodingRate = 0;
@@ -14959,6 +15155,105 @@ static void purgeOldMeshContacts() {
   loraStatus = removed ? String("OLD CONTACTS DELETED ") + String(removed) : "NO OLD CONTACTS";
 }
 
+constexpr uint8_t kMeshReqTelemetry = 0x03;
+constexpr uint8_t kMeshTelemPermBase = 0x01;
+constexpr uint8_t kMeshTelemPermLocation = 0x02;
+constexpr uint8_t kLppVoltage = 116;
+constexpr uint8_t kLppPercentage = 120;
+constexpr uint8_t kLppGps = 136;
+static uint32_t meshPendingTelemetryTag = 0;
+static int meshPendingTelemetryContact = -1;
+static int meshReciprocalTelemetryContact = -1;
+static uint32_t meshReciprocalTelemetryDueMs = 0;
+
+static void appendLppU16(uint8_t *buffer, uint8_t &length, uint16_t value) {
+  buffer[length++] = static_cast<uint8_t>(value >> 8);
+  buffer[length++] = static_cast<uint8_t>(value);
+}
+
+static void appendLppS24(uint8_t *buffer, uint8_t &length, int32_t value) {
+  buffer[length++] = static_cast<uint8_t>(value >> 16);
+  buffer[length++] = static_cast<uint8_t>(value >> 8);
+  buffer[length++] = static_cast<uint8_t>(value);
+}
+
+static int32_t readLppS24(const uint8_t *data) {
+  int32_t value = (static_cast<int32_t>(data[0]) << 16) |
+                  (static_cast<int32_t>(data[1]) << 8) |
+                  static_cast<int32_t>(data[2]);
+  if (value & 0x00800000L) value |= static_cast<int32_t>(0xFF000000L);
+  return value;
+}
+
+static uint8_t lppValueLength(uint8_t type) {
+  switch (type) {
+    case 0:
+    case 1:
+    case 102:
+    case 104:
+    case kLppPercentage:
+    case 142: return 1;
+    case 2:
+    case 3:
+    case 101:
+    case 103:
+    case 115:
+    case kLppVoltage:
+    case 117:
+    case 121:
+    case 125:
+    case 128:
+    case 132: return 2;
+    case 135: return 3;
+    case 100:
+    case 118:
+    case 130:
+    case 131:
+    case 133: return 4;
+    case 113:
+    case 134: return 6;
+    case kLppGps: return 9;
+    default: return 0;
+  }
+}
+
+static bool decodeMeshLpp(const uint8_t *data, uint8_t len, double &lat, double &lon,
+                          bool &hasGps, int &battery, float &batteryVoltage) {
+  hasGps = false;
+  battery = -1;
+  batteryVoltage = 0.0f;
+  uint8_t pos = 0;
+  bool found = false;
+  while (pos + 2 <= len) {
+    const uint8_t channel = data[pos++];
+    const uint8_t type = data[pos++];
+    if (channel == 0) break;
+    const uint8_t valueLen = lppValueLength(type);
+    if (valueLen == 0 || pos + valueLen > len) break;
+    if (type == kLppGps) {
+      lat = static_cast<double>(readLppS24(&data[pos])) / 10000.0;
+      lon = static_cast<double>(readLppS24(&data[pos + 3])) / 10000.0;
+      hasGps = lat >= -90.0 && lat <= 90.0 && lon >= -180.0 && lon <= 180.0 &&
+               (fabs(lat) > 0.000001 || fabs(lon) > 0.000001);
+      found = found || hasGps;
+    } else if (type == kLppVoltage) {
+      batteryVoltage =
+          static_cast<float>((static_cast<uint16_t>(data[pos]) << 8) | data[pos + 1]) /
+          100.0f;
+      if (batteryVoltage >= 2.5f && batteryVoltage <= 5.0f) {
+        battery = max<int>(0, min<int>(100,
+            static_cast<int>((batteryVoltage - 3.30f) * (100.0f / 0.90f))));
+      }
+      found = true;
+    } else if (type == kLppPercentage) {
+      battery = max<int>(0, min<int>(100, data[pos]));
+      found = true;
+    }
+    pos = static_cast<uint8_t>(pos + valueLen);
+  }
+  return found;
+}
+
 class Tab5MeshMillis : public mesh::MillisecondClock {
 public:
   unsigned long getMillis() override { return millis(); }
@@ -15010,10 +15305,6 @@ class Tab5AtMeshRadio : public mesh::Radio {
 
 public:
   void begin() override {
-    if (wifiBootProfileMode) {
-      debugPrint("MESHCORE: begin skipped in Wi-Fi profile");
-      return;
-    }
     initLoraPortA(false);
     if (!loraP2pConfigured && loraConfigStep == 0) beginLoraP2pConfiguration();
   }
@@ -15121,17 +15412,18 @@ protected:
     int idx = findMeshContactById(pubHex);
     if (idx >= 0) {
       MeshContact &uiContact = meshContacts[idx];
+      const bool identityChanged = uiContact.name != displayName;
       uiContact.name = displayName;
       uiContact.shortName = uiContact.name.substring(0, min<size_t>(4, uiContact.name.length()));
       uiContact.deviceId = pubHex;
       if (hasGps) {
-        updateMeshContactTelemetry(idx, lat, lon, true, -1,
+        updateMeshContactTelemetry(idx, lat, lon, true, -1, 0.0f,
                                    meshCurrentRxRssi, meshCurrentRxSnr);
       } else {
-        updateMeshContactTelemetry(idx, 0.0, 0.0, false, -1,
+        updateMeshContactTelemetry(idx, 0.0, 0.0, false, -1, 0.0f,
                                    meshCurrentRxRssi, meshCurrentRxSnr);
       }
-      saveMeshSettings();
+      if (identityChanged) saveMeshSettings();
     }
     MeshPacketRecord record;
     record.timestamp = meshCoreTimeString();
@@ -15152,18 +15444,28 @@ protected:
 
   void onMessageRecv(const ContactInfo &contact, mesh::Packet *pkt,
                      uint32_t senderTimestamp, const char *text) override {
+    debugPrint("MESHCORE: direct message rx sender=%s bytes=%u text=%s",
+               contact.name, static_cast<unsigned>(text ? strlen(text) : 0),
+               text ? text : "");
     addIncomingText(contact.name, text, "MESSAGE", "DIRECT");
+    noteMeshUnreadMessage();
   }
 
   void onCommandDataRecv(const ContactInfo &contact, mesh::Packet *pkt,
                          uint32_t senderTimestamp, const char *text) override {
+    debugPrint("MESHCORE: command message rx sender=%s bytes=%u",
+               contact.name, static_cast<unsigned>(text ? strlen(text) : 0));
     addIncomingText(contact.name, text, "MESSAGE", "COMMAND");
+    noteMeshUnreadMessage();
   }
 
   void onSignedMessageRecv(const ContactInfo &contact, mesh::Packet *pkt,
                            uint32_t senderTimestamp, const uint8_t *senderPrefix,
                            const char *text) override {
+    debugPrint("MESHCORE: signed message rx sender=%s bytes=%u",
+               contact.name, static_cast<unsigned>(text ? strlen(text) : 0));
     addIncomingText(contact.name, text, "MESSAGE", "SIGNED");
+    noteMeshUnreadMessage();
   }
 
   uint32_t calcFloodTimeoutMillisFor(uint32_t pktAirtimeMillis) const override {
@@ -15188,6 +15490,9 @@ protected:
     record.text = text ? String(text) : "";
     addMeshPacketRecord(record);
     loraStatus = "CHANNEL MESSAGE";
+    noteMeshUnreadMessage();
+    debugPrint("MESHCORE: channel message rx bytes=%u text=%s",
+               static_cast<unsigned>(text ? strlen(text) : 0), text ? text : "");
   }
 
   void onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt,
@@ -15218,7 +15523,7 @@ protected:
         record.detail = text;
         int idx = meshChatSelected >= 0 ? meshChatSelected : -1;
         if (idx >= 0 && idx < static_cast<int>(meshContactCount)) {
-          updateMeshContactTelemetry(idx, lat, lon, hasGps, battery,
+          updateMeshContactTelemetry(idx, lat, lon, hasGps, battery, 0.0f,
                                      meshCurrentRxRssi, meshCurrentRxSnr);
         }
       }
@@ -15228,10 +15533,116 @@ protected:
 
   uint8_t onContactRequest(const ContactInfo &contact, uint32_t senderTimestamp,
                            const uint8_t *data, uint8_t len, uint8_t *reply) override {
-    return 0;
+    if (!data || !reply || len < 1 || data[0] != kMeshReqTelemetry) return 0;
+    char pubHex[PUB_KEY_SIZE * 2 + 1] = {};
+    mesh::Utils::toHex(pubHex, contact.id.pub_key, PUB_KEY_SIZE);
+    const int contactIndex = findMeshContactById(pubHex);
+    if (contactIndex < 0 || !meshContacts[contactIndex].telemetryAllowed) {
+      debugPrint("MESHCORE: telemetry request denied contact=%s", pubHex);
+      return 0;
+    }
+    const uint8_t shareMode = activeMeshTelemetryShareMode();
+    if (shareMode == MESH_TELEMETRY_OFF) {
+      debugPrint("MESHCORE: telemetry sharing off network=%s",
+                 activeMeshNetworkPreset().name);
+      return 0;
+    }
+    uint8_t requestedPermissions =
+        static_cast<uint8_t>(kMeshTelemPermBase | kMeshTelemPermLocation);
+    if (len > 1) requestedPermissions &= static_cast<uint8_t>(~data[1]);
+    uint8_t responseLen = 4;
+    memcpy(reply, &senderTimestamp, 4);
+    if (requestedPermissions & kMeshTelemPermBase) {
+      int16_t batteryMv = M5.Power.getBatteryVoltage();
+      if (batteryMv > 0) {
+        reply[responseLen++] = 1;
+        reply[responseLen++] = kLppVoltage;
+        appendLppU16(reply, responseLen,
+                     static_cast<uint16_t>(max<int>(0, batteryMv) / 10));
+      }
+      int batteryPct = M5.Power.getBatteryLevel();
+      if (batteryPct >= 0 && batteryPct <= 100) {
+        reply[responseLen++] = 2;
+        reply[responseLen++] = kLppPercentage;
+        reply[responseLen++] = static_cast<uint8_t>(batteryPct);
+      }
+    }
+    if (shareMode == MESH_TELEMETRY_FULL && meshIncludeLocation &&
+        (requestedPermissions & kMeshTelemPermLocation)) {
+      double lat = 0.0;
+      double lon = 0.0;
+      if (getMeshAdvertLocation(lat, lon)) {
+        reply[responseLen++] = 1;
+        reply[responseLen++] = kLppGps;
+        appendLppS24(reply, responseLen, static_cast<int32_t>(lat * 10000.0));
+        appendLppS24(reply, responseLen, static_cast<int32_t>(lon * 10000.0));
+        appendLppS24(reply, responseLen, 0);
+      }
+    }
+    debugPrint("MESHCORE: telemetry reply contact=%s mode=%s bytes=%u",
+               pubHex, meshTelemetryShareModeName(shareMode),
+               static_cast<unsigned>(responseLen));
+    if (activeMeshTelemetryShareMode() == MESH_TELEMETRY_FULL &&
+        contactIndex >= 0 &&
+        meshContacts[contactIndex].telemetryAllowed) {
+      // The peer asked for our telemetry, so request its telemetry after this
+      // response finishes. This makes position exchange symmetric and allows
+      // the saved T-Deck contact to appear on the main map automatically.
+      meshReciprocalTelemetryContact = contactIndex;
+      meshReciprocalTelemetryDueMs = millis() + 4500U;
+    }
+    return responseLen > 4 ? responseLen : 0;
   }
 
-  void onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) override {}
+  void onContactResponse(const ContactInfo &contact, const uint8_t *data, uint8_t len) override {
+    if (!data || len <= 4) return;
+    uint32_t tag = 0;
+    memcpy(&tag, data, 4);
+    if (meshPendingTelemetryTag == 0 || tag != meshPendingTelemetryTag) return;
+    char pubHex[PUB_KEY_SIZE * 2 + 1] = {};
+    mesh::Utils::toHex(pubHex, contact.id.pub_key, PUB_KEY_SIZE);
+    int contactIndex = findMeshContactById(pubHex);
+    if (contactIndex < 0) contactIndex = meshPendingTelemetryContact;
+    double lat = 0.0;
+    double lon = 0.0;
+    bool hasGps = false;
+    int battery = -1;
+    float batteryVoltage = 0.0f;
+    if (contactIndex >= 0 &&
+        decodeMeshLpp(data + 4, static_cast<uint8_t>(len - 4), lat, lon, hasGps,
+                      battery, batteryVoltage)) {
+      updateMeshContactTelemetry(contactIndex, lat, lon, hasGps, battery,
+                                 batteryVoltage, meshCurrentRxRssi, meshCurrentRxSnr);
+      MeshPacketRecord record;
+      record.timestamp = meshCoreTimeString();
+      record.sender = meshContacts[contactIndex].name;
+      record.rssi = meshCurrentRxRssi;
+      record.snr = meshCurrentRxSnr;
+      record.type = "TELEMETRY";
+      if (hasGps) record.detail = String(lat, 5) + "," + String(lon, 5);
+      if (battery >= 0) {
+        if (record.detail.length()) record.detail += " ";
+        record.detail += "BATT " + String(battery) + "%";
+      }
+      if (batteryVoltage > 0.0f) {
+        if (record.detail.length()) record.detail += " ";
+        record.detail += String(batteryVoltage, 2) + "V";
+      }
+      addMeshPacketRecord(record);
+      loraStatus = "TELEMETRY RECEIVED";
+      debugPrint("MESHCORE: telemetry rx contact=%s gps=%u batt=%d voltage=%.2f",
+                 pubHex, hasGps ? 1U : 0U, battery,
+                 static_cast<double>(batteryVoltage));
+    } else {
+      loraStatus = "TELEMETRY DATA INVALID";
+      debugPrint("MESHCORE: telemetry response invalid contact=%s bytes=%u",
+                 pubHex, static_cast<unsigned>(len));
+    }
+    meshPendingTelemetryTag = 0;
+    meshPendingTelemetryContact = -1;
+    meshContentOnlyRedraw = true;
+    waypointsDirty = true;
+  }
 
 private:
   void addIncomingText(const char *sender, const char *text, const char *type, const char *detail) {
@@ -15276,6 +15687,74 @@ static bool meshContactToContactInfo(const MeshContact &src, ContactInfo &dest) 
     dest.gps_lon = static_cast<int32_t>(src.lon * 1000000.0);
   }
   return true;
+}
+
+static bool requestSelectedMeshTelemetry() {
+  if (meshContactSelected < 0 ||
+      meshContactSelected >= static_cast<int>(meshContactCount)) {
+    loraStatus = "SELECT A SAVED CONTACT";
+    return false;
+  }
+  MeshContact &uiContact = meshContacts[meshContactSelected];
+  if (!uiContact.telemetryAllowed) {
+    loraStatus = "TELEMETRY DISABLED FOR CONTACT";
+    return false;
+  }
+  tab5MeshCoreBegin();
+  if (!loraP2pConfigured) {
+    loraStatus = "RADIO NOT READY";
+    beginLoraP2pConfiguration();
+    return false;
+  }
+  ContactInfo contact;
+  if (!meshContactToContactInfo(uiContact, contact)) {
+    loraStatus = "CONTACT NEEDS PUBLIC KEY";
+    return false;
+  }
+  ContactInfo *recipient =
+      tab5MeshNode.lookupContactByPubKey(contact.id.pub_key, PUB_KEY_SIZE);
+  if (!recipient) {
+    tab5MeshNode.addContact(contact);
+    recipient = tab5MeshNode.lookupContactByPubKey(contact.id.pub_key, PUB_KEY_SIZE);
+  }
+  if (!recipient) {
+    loraStatus = "CONTACT TABLE FULL";
+    return false;
+  }
+  uint8_t request[4] = {
+      kMeshReqTelemetry,
+      static_cast<uint8_t>(~(kMeshTelemPermBase | kMeshTelemPermLocation)),
+      0,
+      0};
+  uint32_t tag = 0;
+  uint32_t estimatedTimeout = 0;
+  int result = tab5MeshNode.sendRequest(*recipient, request, sizeof(request), tag,
+                                        estimatedTimeout);
+  if (result == MSG_SEND_FAILED) {
+    loraStatus = "TELEMETRY REQUEST FAILED";
+    return false;
+  }
+  meshPendingTelemetryTag = tag;
+  meshPendingTelemetryContact = meshContactSelected;
+  loraStatus = "TELEMETRY REQUEST SENT";
+  debugPrint("MESHCORE: telemetry request contact=%s tag=%lu timeout=%lu result=%d",
+             uiContact.deviceId.c_str(), static_cast<unsigned long>(tag),
+             static_cast<unsigned long>(estimatedTimeout), result);
+  return true;
+}
+
+static void toggleSelectedMeshContactMap() {
+  if (meshContactSelected < 0 ||
+      meshContactSelected >= static_cast<int>(meshContactCount)) {
+    loraStatus = "SELECT A SAVED CONTACT";
+    return;
+  }
+  MeshContact &contact = meshContacts[meshContactSelected];
+  contact.showOnMap = !contact.showOnMap;
+  saveMeshSettings();
+  mapDirty = true;
+  mapOverlayDirty = true;
+  loraStatus = contact.showOnMap ? "MAP MARKER ENABLED" : "MAP MARKER HIDDEN";
 }
 
 static void tab5MeshLoadIdentity() {
@@ -15331,9 +15810,45 @@ static void tab5MeshCoreAdvert(bool flood) {
   loraStatus = flood ? "ADVERT FLOOD QUEUED" : "ADVERT LOCAL QUEUED";
 }
 
+static void requestTab5MeshCoreAdvert(bool flood) {
+  tab5MeshCoreBegin();
+  if (!loraP2pConfigured) {
+    meshAdvertPending = true;
+    meshAdvertPendingFlood = meshAdvertPendingFlood || flood;
+    if (loraConfigStep == 0) beginLoraP2pConfiguration();
+    loraStatus = "DISCOVERY WAITING FOR RADIO";
+    debugPrint("MESHCORE: advert deferred flood=%u step=%u pending=%u",
+               flood ? 1U : 0U, static_cast<unsigned>(loraConfigStep),
+               loraCommandPending ? 1U : 0U);
+    return;
+  }
+  tab5MeshCoreAdvert(flood);
+}
+
 void tab5MeshCoreLoop(uint32_t now) {
   if (!tab5MeshStarted) return;
   tab5MeshNode.loop();
+  if (meshReciprocalTelemetryContact >= 0 &&
+      static_cast<int32_t>(now - meshReciprocalTelemetryDueMs) >= 0 &&
+      meshPendingTelemetryTag == 0 && loraP2pConfigured &&
+      !loraCommandPending && tab5MeshRadio.isSendComplete()) {
+    int contactIndex = meshReciprocalTelemetryContact;
+    meshReciprocalTelemetryContact = -1;
+    meshReciprocalTelemetryDueMs = 0;
+    int savedSelection = meshContactSelected;
+    meshContactSelected = contactIndex;
+    bool queued = requestSelectedMeshTelemetry();
+    meshContactSelected = savedSelection;
+    debugPrint("MESHCORE: reciprocal telemetry contact=%d queued=%u",
+               contactIndex, queued ? 1U : 0U);
+  }
+  if (meshAdvertPending && loraP2pConfigured && !loraCommandPending) {
+    const bool flood = meshAdvertPendingFlood;
+    meshAdvertPending = false;
+    meshAdvertPendingFlood = false;
+    tab5MeshCoreAdvert(flood);
+    debugPrint("MESHCORE: deferred advert queued flood=%u", flood ? 1U : 0U);
+  }
   double lat = 0.0;
   double lon = 0.0;
   bool hasGps = meshIncludeLocation && getMeshAdvertLocation(lat, lon);
@@ -15373,27 +15888,26 @@ static void activateMeshMenuItem() {
     case 1: loraView = LORA_VIEW_DISCOVER; break;
     case 2: loraView = LORA_VIEW_IDENTITY; break;
     case 3: loraView = LORA_VIEW_RADIO; break;
-    case 4: loraView = LORA_VIEW_CONTACTS; break;
+    case 4: loraView = LORA_VIEW_POWER; break;
+    case 5: loraView = LORA_VIEW_CONTACTS; break;
     default: loraView = LORA_VIEW_MESSAGES; break;
   }
   loraInput = "";
+  meshContentOnlyRedraw = true;
+  waypointsDirty = true;
 }
 
 static void activateMeshDiscoverItem() {
   switch (meshDiscoverSelected) {
     case 0:
-      beginLoraP2pConfiguration();
-      tab5MeshCoreBegin();
-      tab5MeshCoreAdvert(false);
-      loraStatus = "DISCOVER ID SENT";
+      requestTab5MeshCoreAdvert(false);
+      if (loraP2pConfigured) loraStatus = "DISCOVERY LISTENING";
       break;
     case 1:
-      tab5MeshCoreBegin();
-      tab5MeshCoreAdvert(false);
+      requestTab5MeshCoreAdvert(false);
       break;
     case 2:
-      tab5MeshCoreBegin();
-      tab5MeshCoreAdvert(true);
+      requestTab5MeshCoreAdvert(true);
       break;
     case 3:
       addDiscoveredMeshContact(meshContactSelected);
@@ -15404,6 +15918,8 @@ static void activateMeshDiscoverItem() {
     default:
       break;
   }
+  meshContentOnlyRedraw = true;
+  waypointsDirty = true;
 }
 
 static String encodeMeshCorePublicMessage(const String &message) {
@@ -15520,7 +16036,8 @@ static bool decodeMeshCorePublicMessageDetailed(const String &hex, MeshPacketRec
     }
     if (record.sender != "UNKNOWN") {
       int idx = findMeshContactByIdOrName(record.sender);
-      updateMeshContactTelemetry(idx, lat, lon, hasGps, battery, record.rssi, record.snr);
+      updateMeshContactTelemetry(idx, lat, lon, hasGps, battery, 0.0f,
+                                 record.rssi, record.snr);
     }
   } else {
     record.type = "MESSAGE";
@@ -15547,7 +16064,23 @@ static void sendLoraCommand(const String &command) {
   debugPrint("LORA: tx %s", command.c_str());
 }
 
+static uint8_t loraBandwidthCode(uint16_t bandwidthKhz) {
+  // RUI3's individual P2P bandwidth command uses an enum, not a kHz value.
+  // Keep the display/storage values human readable while translating here.
+  if (bandwidthKhz >= 490) return 2;  // 500 kHz
+  if (bandwidthKhz >= 240) return 1;  // 250 kHz
+  if (bandwidthKhz >= 120) return 0;  // 125 kHz
+  if (bandwidthKhz >= 60) return 9;   // 62.5 kHz
+  if (bandwidthKhz >= 40) return 8;   // 41.67 kHz
+  if (bandwidthKhz >= 30) return 7;   // 31.25 kHz
+  if (bandwidthKhz >= 19) return 6;   // 20.83 kHz
+  if (bandwidthKhz >= 14) return 5;   // 15.63 kHz
+  if (bandwidthKhz >= 9) return 4;    // 10.4 kHz
+  return 3;                           // 7.8 kHz
+}
+
 static void sendLoraConfigStep() {
+  MeshNetworkPreset preset = activeMeshNetworkPreset();
   switch (loraConfigStep) {
     case 1:
       sendLoraCommand("AT+PRECV=0");
@@ -15558,17 +16091,34 @@ static void sendLoraConfigStep() {
       loraStatus = "P2P MODE";
       break;
     case 3:
-      {
-        MeshNetworkPreset preset = activeMeshNetworkPreset();
-        String moduleBandwidth = preset.bandwidthKhz == 62 ? "62.5" : String(preset.bandwidthKhz);
-        sendLoraCommand(String("AT+P2P=") + String(preset.frequencyHz) + ":" +
-                        String(preset.spreadingFactor) + ":" +
-                        moduleBandwidth + ":" + String(preset.moduleCodingRate) + ":" +
-                        String(kLoraP2pPreamble) + ":" + String(preset.powerDbm));
-      }
-      loraStatus = "RADIO CONFIG";
+      sendLoraCommand(String("AT+RFFREQUENCY=") + String(preset.frequencyHz));
+      loraStatus = "SET FREQUENCY";
       break;
     case 4:
+      sendLoraCommand(String("AT+SPREADINGFACTOR=") + String(preset.spreadingFactor));
+      loraStatus = "SET SPREADING";
+      break;
+    case 5:
+      sendLoraCommand(String("AT+BANDWIDTH=") + String(loraBandwidthCode(preset.bandwidthKhz)));
+      loraStatus = "SET BANDWIDTH";
+      break;
+    case 6:
+      sendLoraCommand(String("AT+CODINGRATE=") + String(preset.moduleCodingRate));
+      loraStatus = "SET CODING";
+      break;
+    case 7:
+      sendLoraCommand(String("AT+SYNCWORD=") + kMeshCoreLoraSyncWord);
+      loraStatus = "SET SYNC WORD";
+      break;
+    case 8:
+      sendLoraCommand(String("AT+PREAMBLELENGTH=") + String(kLoraP2pPreamble));
+      loraStatus = "SET PREAMBLE";
+      break;
+    case 9:
+      sendLoraCommand(String("AT+TXOUTPUTPOWER=") + String(preset.powerDbm));
+      loraStatus = "SET POWER";
+      break;
+    case 10:
       sendLoraCommand("AT+PRECV=65533");
       loraStatus = "RX START";
       break;
@@ -15578,18 +16128,24 @@ static void sendLoraConfigStep() {
 }
 
 void beginLoraP2pConfiguration() {
+  if (loraConfigStep != 0 && loraCommandPending) {
+    debugPrint("LORA: config already active step=%u", static_cast<unsigned>(loraConfigStep));
+    return;
+  }
   loraProbePending = false;
   loraP2pConfigured = false;
   loraConfigStep = 1;
   loraConfigRetries = 0;
   sendLoraConfigStep();
-  waypointsDirty = true;
+  if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex) {
+    meshContentOnlyRedraw = true;
+    waypointsDirty = true;
+  }
 }
 
 void ensureLoraP2pConfigured() {
   if (loraP2pConfigured) {
     loraStatus = "LISTENING";
-    waypointsDirty = true;
     return;
   }
   if (loraConfigStep == 0) {
@@ -15658,13 +16214,11 @@ void sendLoraTextMessage() {
   recordSentMessage("PUBLIC TX");
   loraInput = "";
   loraStatus = "TRANSMITTING";
+  meshContentOnlyRedraw = true;
   waypointsDirty = true;
 }
 
 void initLoraPortA(bool force) {
-  if (wifiBootProfileMode && !force) {
-    return;
-  }
   if (loraPortReady && !force) {
     return;
   }
@@ -15688,9 +16242,6 @@ void initLoraPortA(bool force) {
 }
 
 static void sendLoraAtProbe() {
-  if (wifiBootProfileMode) {
-    return;
-  }
   if (!loraPortReady) {
     initLoraPortA(false);
   }
@@ -15701,9 +16252,6 @@ static void sendLoraAtProbe() {
 }
 
 void pollLoraPortA(uint32_t now) {
-  if (wifiBootProfileMode) {
-    return;
-  }
   if (!loraPortReady) {
     initLoraPortA(false);
   }
@@ -15736,17 +16284,20 @@ void pollLoraPortA(uint32_t now) {
           loraProbePending = false;
           loraCommandPending = false;
           loraConfigRetries = 0;
-          if (loraConfigStep > 0 && loraConfigStep < 4) {
+          if (loraConfigStep > 0 && loraConfigStep < 10) {
             ++loraConfigStep;
             sendLoraConfigStep();
-          } else if (loraConfigStep == 4) {
+          } else if (loraConfigStep == 10) {
             loraConfigStep = 0;
             loraP2pConfigured = true;
             loraStatus = "LISTENING";
-            addLoraMessage("RADIO READY 915.000");
+            addLoraMessage(String("RADIO READY ") +
+                           String(activeMeshNetworkPreset().frequencyHz / 1000000.0, 3));
           } else if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex &&
                      !loraP2pConfigured) {
             beginLoraP2pConfiguration();
+          } else if (loraP2pConfigured) {
+            loraStatus = "LISTENING";
           } else {
             loraStatus = "MODULE READY";
           }
@@ -15758,6 +16309,15 @@ void pollLoraPortA(uint32_t now) {
             String snr = line.substring(first + 1, second);
             String payloadHex = line.substring(second + 1);
             bool decodedByRealMesh = tab5MeshCoreHandleRx(payloadHex, rssi, snr);
+            if (payloadHex.length() >= 2) {
+              uint8_t header = static_cast<uint8_t>(
+                  strtoul(payloadHex.substring(0, 2).c_str(), nullptr, 16));
+              debugPrint("MESHCORE: rx raw header=0x%02X type=%u route=%u bytes=%u callback=%u",
+                         header, static_cast<unsigned>((header >> 2) & 0x0F),
+                         static_cast<unsigned>(header & 0x03),
+                         static_cast<unsigned>(payloadHex.length() / 2),
+                         decodedByRealMesh ? 1U : 0U);
+            }
             MeshPacketRecord record;
             record.timestamp = meshCoreTimeString(now);
             record.rssi = rssi;
@@ -15783,6 +16343,9 @@ void pollLoraPortA(uint32_t now) {
         } else if (line.startsWith("+EVT:TXP2P")) {
           loraCommandPending = false;
           tab5MeshCoreNotifyTxDone(line.indexOf("DONE") >= 0);
+          // RUI 4.0.6 automatically returns to continuous P2P receive after TX.
+          // Sending PRECV again here produces P2P_RX_ON/AT_BUSY_ERROR and can
+          // briefly hide a valid inbound discovery packet.
           loraStatus = line.indexOf("DONE") >= 0 ? "LISTENING" : "TX ERROR";
         } else if (line.indexOf("ERROR") >= 0) {
           loraCommandPending = false;
@@ -15796,9 +16359,6 @@ void pollLoraPortA(uint32_t now) {
             loraConfigStep = 0;
           }
           addLoraMessage(line);
-        }
-        if (screen == SCREEN_WAYPOINTS && appSelected == kAppLoraIndex) {
-          waypointsDirty = true;
         }
       }
       continue;
@@ -16191,6 +16751,140 @@ static bool drawCachedMapTile(M5Canvas &target, const char *path,
   }
   entry->canvas->pushSprite(&target, drawX, drawY);
   return true;
+}
+
+static bool mapTileAlreadyCached(int zoom, int tileX, int tileY) {
+  for (const auto &entry : mapTileCache) {
+    if (entry.valid && entry.zoom == zoom && entry.tileX == tileX &&
+        entry.tileY == tileY) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void warmAdjacentMapZoomCache(uint32_t now) {
+  // Decode only one tile per idle pass. Keeping this work off the zoom-button
+  // path makes zoom changes feel immediate without stealing time from driving,
+  // keyboard panning, downloads, or an app that owns the foreground.
+  static uint32_t lastWarmMs = 0;
+  static bool warmHigherFirst = true;
+  static int warmBaseZoom = -1;
+  static int warmBaseTileX = -1;
+  static int warmBaseTileY = -1;
+  static bool higherDone = false;
+  static bool lowerDone = false;
+  if (now - lastWarmMs < 180 || screen != SCREEN_MAIN ||
+      mapViewMode != MapViewMode::NAV || !sdReady || !mapTilesDrawn ||
+      !mapRenderCanvasValid || mapDirty || mapPanHeldKey != 0 ||
+      mapPanPendingKey != 0 || mapDownload.active || tileDownloadActive ||
+      tileDownloadQueued || usbMscActive || vehicleMotionActive(now)) {
+    return;
+  }
+  lastWarmMs = now;
+
+  double centerLat = 0.0;
+  double centerLon = 0.0;
+  if (!getMapCenter(centerLat, centerLon)) return;
+
+  double baseCenterPx = 0.0;
+  double baseCenterPy = 0.0;
+  geoToWorldPixels(centerLat, centerLon, mapZoom, baseCenterPx, baseCenterPy);
+  int baseTileX = static_cast<int>(floor(baseCenterPx / 256.0));
+  int baseTileY = static_cast<int>(floor(baseCenterPy / 256.0));
+  if (warmBaseZoom != mapZoom || warmBaseTileX != baseTileX ||
+      warmBaseTileY != baseTileY) {
+    warmBaseZoom = mapZoom;
+    warmBaseTileX = baseTileX;
+    warmBaseTileY = baseTileY;
+    higherDone = false;
+    lowerDone = false;
+  }
+
+  // The current view and pan border can occupy about 22 cache slots. Twelve
+  // tiles at each neighboring zoom keeps the total below the 48-slot limit.
+  constexpr uint8_t kWarmTilesPerZoom = 12;
+  for (uint8_t pass = 0; pass < 2; ++pass) {
+    bool tryHigher = (pass == 0) ? warmHigherFirst : !warmHigherFirst;
+    bool &directionDone = tryHigher ? higherDone : lowerDone;
+    if (directionDone) continue;
+    int candidateZoom = static_cast<int>(mapZoom) + (tryHigher ? 1 : -1);
+    if (candidateZoom < mapMinZoom || candidateZoom > mapMaxZoom) {
+      directionDone = true;
+      continue;
+    }
+
+    double centerPx = 0.0;
+    double centerPy = 0.0;
+    geoToWorldPixels(centerLat, centerLon, static_cast<uint8_t>(candidateZoom),
+                     centerPx, centerPy);
+    int tileCount = 1 << candidateZoom;
+    double left = centerPx - mapW / 2.0;
+    double top = centerPy - mapH / 2.0;
+    double world = 256.0 * tileCount;
+    if (mapW > world) left = (world - mapW) / 2.0;
+    if (mapH > world) top = (world - mapH) / 2.0;
+    int startTileX = static_cast<int>(floor(left / 256.0));
+    int startTileY = static_cast<int>(floor(top / 256.0));
+    int tilesX = mapW / 256 + 2;
+    int tilesY = mapH / 256 + 2;
+    double centerTileX = centerPx / 256.0;
+    double centerTileY = centerPy / 256.0;
+
+    uint8_t cached = 0;
+    int bestX = -1;
+    int bestY = -1;
+    float bestDistance = 1.0e9f;
+    for (int ty = 0; ty < tilesY; ++ty) {
+      int tileY = startTileY + ty;
+      if (tileY < 0 || tileY >= tileCount) continue;
+      for (int tx = 0; tx < tilesX; ++tx) {
+        int tileX = startTileX + tx;
+        int wrappedX = tileX % tileCount;
+        if (wrappedX < 0) wrappedX += tileCount;
+        if (mapTileAlreadyCached(candidateZoom, wrappedX, tileY)) {
+          ++cached;
+          continue;
+        }
+        float dx = static_cast<float>((tileX + 0.5) - centerTileX);
+        float dy = static_cast<float>((tileY + 0.5) - centerTileY);
+        float distance = dx * dx + dy * dy;
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          bestX = wrappedX;
+          bestY = tileY;
+        }
+      }
+    }
+    if (cached >= kWarmTilesPerZoom || bestX < 0 || bestY < 0) {
+      directionDone = true;
+      continue;
+    }
+
+    if (!lockSd(5)) return;
+    char pathBuf[160] = {0};
+    bool hasPath = buildTilePath(pathBuf, sizeof(pathBuf), candidateZoom, bestX, bestY);
+    bool exists = hasPath && SD.exists(pathBuf);
+    bool loaded = false;
+    if (exists) {
+      MapTileCacheEntry *entry =
+          selectMapTileCacheEntry(candidateZoom, bestX, bestY);
+      if (entry) {
+        loaded = loadMapTileCacheEntry(*entry, pathBuf, candidateZoom, bestX, bestY);
+      }
+    }
+    unlockSd();
+    warmHigherFirst = !tryHigher;
+    if (loaded) {
+      if (cached + 1 >= kWarmTilesPerZoom) directionDone = true;
+      debugPrint("MAP: warmed zoom=%d tile=%d/%d cached=%u/%u",
+                 candidateZoom, bestX, bestY,
+                 static_cast<unsigned>(cached + 1),
+                 static_cast<unsigned>(kWarmTilesPerZoom));
+    }
+    return;
+  }
+  warmHigherFirst = !warmHigherFirst;
 }
 
 static bool renderMapCanvasRegion(double centerLat, double centerLon, uint8_t zoom,
@@ -17341,11 +18035,50 @@ void drawNavBar() {
     M5.Display.setTextSize(kNavTextSize);
     M5.Display.drawString(labels[i], navButtons[i].x + navButtons[i].w / 2,
                           navButtons[i].y + navButtons[i].h / 2);
-    if (i == 1 && calendarHasReminder()) {
+    if (i == 1 && (calendarHasReminder() || meshUnreadCount != 0)) {
       M5.Display.setTextDatum(TR_DATUM);
       M5.Display.setTextColor(colors.red, bg);
-      M5.Display.drawString("*", navButtons[i].x + navButtons[i].w - 8, navButtons[i].y + 4);
+      String badge = meshUnreadCount != 0 ? String(meshUnreadCount) : String("*");
+      M5.Display.drawString(badge, navButtons[i].x + navButtons[i].w - 8,
+                            navButtons[i].y + 4);
     }
+  }
+  meshNotificationUiDirty = false;
+}
+
+static void serviceMeshNotificationUi() {
+  if (!meshNotificationUiDirty || !displayReady || screenDimmed ||
+      screen == SCREEN_BOOT || uiDrawBusyUntilMs != 0) {
+    return;
+  }
+  // Only repaint the persistent navigation bar. A background MeshCore packet
+  // must never invalidate the current app or map framebuffer.
+  drawNavBar();
+  mainNavDirty = false;
+
+  if (screen != SCREEN_WAYPOINTS || appSelected != kAppMenuIndex ||
+      meshUnreadCount == 0 || appMenuVisibleCount == 0) {
+    return;
+  }
+  const int pageStart = appMenuPage * kAppsPerPage;
+  const int pageEnd = min<int>(appMenuVisibleCount, pageStart + kAppsPerPage);
+  for (int pos = pageStart; pos < pageEnd; ++pos) {
+    if (appMenuVisibleIndices[pos] != kAppLoraIndex) continue;
+    const int slot = pos % kAppsPerPage;
+    const bool selected = kAppLoraIndex == appMenuKeyboardSelection;
+    const uint16_t bg = selected ? colors.amberDim : colors.black;
+    Rect badgeRect = {
+        static_cast<int16_t>(appButtons[slot].x + appButtons[slot].w - 48),
+        static_cast<int16_t>(appButtons[slot].y + 3), 44, 28};
+    M5.Display.fillRect(badgeRect.x, badgeRect.y, badgeRect.w, badgeRect.h, bg);
+    M5.Display.setTextDatum(TR_DATUM);
+    M5.Display.setTextColor(colors.red, bg);
+    M5.Display.setTextSize(kButtonTextSize);
+    M5.Display.drawString(String(meshUnreadCount),
+                          static_cast<int16_t>(badgeRect.x + badgeRect.w - 4),
+                          static_cast<int16_t>(badgeRect.y + 1));
+    M5.Display.setTextDatum(TL_DATUM);
+    break;
   }
 }
 
@@ -19928,17 +20661,10 @@ static void drawMeshContactsOnMap(double centerLat, double centerLon, uint8_t zo
   };
   for (size_t i = 0; i < meshContactCount; ++i) {
     const MeshContact &contact = meshContacts[i];
-    if (!contact.hasGps) continue;
+    if (!contact.hasGps || !contact.showOnMap || !contact.telemetryAllowed) continue;
     drawMeshMarker(contact.lat, contact.lon,
                    contact.name.length() ? contact.name : contact.deviceId,
                    contact.lastGpsMs, colors.red);
-  }
-  for (size_t i = 0; i < meshDiscoveredCount; ++i) {
-    const MeshDiscoveredContact &peer = meshDiscovered[i];
-    if (!peer.hasGps || findMeshContactById(peer.deviceId) >= 0) continue;
-    drawMeshMarker(peer.lat, peer.lon,
-                   peer.name.length() ? peer.name : peer.deviceId.substring(0, 8),
-                   peer.lastSeenMs, colors.amberDim);
   }
 }
 
@@ -20384,6 +21110,8 @@ void drawMainScreen() {
     M5.Display.clearClipRect();
     mapDirty = false;
     mapOverlayDirty = false;
+    meshMapMarkerDirty = false;
+    meshMapMarkerDirtyRect = {0, 0, 0, 0};
   } else if (mapWaitingOverlayDirty && mapWaitingForLocationServices()) {
     M5.Display.clearClipRect();
     drawMapWaitingForLocationOverlay();
@@ -20436,6 +21164,9 @@ void drawMainScreen() {
     if (!kMapOverlayUseReadback) {
       Rect nextRect = arrowBackgroundRect(cx, cy);
       Rect dirtyRect = unionRect(arrowBackRect, nextRect);
+      if (meshMapMarkerDirty) {
+        dirtyRect = unionRect(dirtyRect, meshMapMarkerDirtyRect);
+      }
       Rect clip = clampRectToMap(dirtyRect);
       if (!isRectValid(clip)) {
         mapDirty = true;
@@ -20468,6 +21199,8 @@ void drawMainScreen() {
       lastArrowCy = cy;
       lastOverlayDrawMs = millis();
       mapOverlayDirty = false;
+      meshMapMarkerDirty = false;
+      meshMapMarkerDirtyRect = {0, 0, 0, 0};
       return;
     }
 
@@ -23111,6 +23844,31 @@ static int meshSelectionForView(LoraView view) {
   }
 }
 
+static int16_t meshAppContentTop() {
+  return static_cast<int16_t>(appTopBarRect.h + 62);
+}
+
+static void drawMeshStatusStrip() {
+  Rect strip = {12, static_cast<int16_t>(appTopBarRect.h + 6),
+                static_cast<int16_t>(screenW - 24), 48};
+  drawTerminalPanel(strip, loraP2pConfigured ? colors.amber : colors.amberDim);
+  M5.Display.setTextSize(kSmallTextSize);
+  M5.Display.setTextDatum(ML_DATUM);
+  M5.Display.setTextColor(colors.amber, colors.black);
+  M5.Display.drawString(activeMeshNetworkPreset().name, strip.x + 12,
+                        strip.y + strip.h / 2);
+  M5.Display.setTextDatum(MC_DATUM);
+  M5.Display.setTextColor(loraP2pConfigured ? colors.amber : colors.redDim, colors.black);
+  M5.Display.drawString(loraP2pConfigured ? "RADIO ONLINE" : "RADIO STARTING",
+                        strip.x + strip.w / 2, strip.y + strip.h / 2);
+  M5.Display.setTextDatum(MR_DATUM);
+  M5.Display.setTextColor(colors.amberDim, colors.black);
+  String counts = String(meshDiscoveredCount) + " NEARBY  /  " +
+                  String(meshContactCount) + " SAVED";
+  M5.Display.drawString(counts, strip.x + strip.w - 12, strip.y + strip.h / 2);
+  M5.Display.setTextDatum(TL_DATUM);
+}
+
 static void drawMeshSelectionMarker(const Rect &rect, bool selected) {
   const uint16_t border = selected ? colors.amber : colors.amberDim;
   M5.Display.drawRect(rect.x, rect.y, rect.w, rect.h, border);
@@ -23123,7 +23881,7 @@ static bool drawMeshSelectionDelta(LoraView view, int oldSelection, int newSelec
                                    bool oldPeerFocus, bool newPeerFocus) {
   if (oldSelection == newSelection && oldPeerFocus == newPeerFocus) return true;
   M5.Display.setTextSize(kSmallTextSize);
-  const int16_t contentTop = static_cast<int16_t>(appTopBarRect.h + 8);
+  const int16_t contentTop = meshAppContentTop();
   const int16_t contentBottom = static_cast<int16_t>(appPrimaryButton.y - 10);
   const int16_t lineH = static_cast<int16_t>(M5.Display.fontHeight() + 6);
   const int16_t rowStep = max<int16_t>(static_cast<int16_t>(lineH + 32), 64);
@@ -23194,14 +23952,90 @@ static bool drawMeshSelectionDelta(LoraView view, int oldSelection, int newSelec
   return false;
 }
 
+static bool drawMeshTextInputDelta(LoraView view) {
+  M5.Display.setTextSize(kSmallTextSize);
+  M5.Display.setTextDatum(TL_DATUM);
+  const int16_t contentTop = meshAppContentTop();
+  const int16_t contentBottom = static_cast<int16_t>(appPrimaryButton.y - 10);
+  const int16_t lineH = static_cast<int16_t>(M5.Display.fontHeight() + 6);
+  const int16_t rowStep = max<int16_t>(static_cast<int16_t>(lineH + 32), 64);
+  const int16_t rowH = max<int16_t>(static_cast<int16_t>(lineH + 24), 56);
+  auto trimToWidth = [&](String text, int16_t width) {
+    while (text.length() > 0 && M5.Display.textWidth(text) > width) text.remove(text.length() - 1);
+    return text;
+  };
+  auto drawInputRow = [&](int index, const String &label, const String &value) {
+    Rect rect = {40, static_cast<int16_t>(contentTop + 10 + index * rowStep),
+                 static_cast<int16_t>(screenW - 80), rowH};
+    M5.Display.fillRect(rect.x, rect.y, rect.w, rect.h, colors.black);
+    M5.Display.drawRect(rect.x, rect.y, rect.w, rect.h, colors.amber);
+    M5.Display.fillRect(static_cast<int16_t>(rect.x + 3), static_cast<int16_t>(rect.y + 3), 6,
+                        static_cast<int16_t>(max<int16_t>(1, rect.h - 6)), colors.amber);
+    M5.Display.setTextColor(colors.amber, colors.black);
+    M5.Display.drawString(trimToWidth(label, rect.w / 2 - 18), rect.x + 14,
+                          rect.y + (rect.h - M5.Display.fontHeight()) / 2);
+    M5.Display.setTextColor(colors.amberDim, colors.black);
+    M5.Display.setTextDatum(TR_DATUM);
+    M5.Display.drawString(trimToWidth(value, rect.w / 2 - 10), rect.x + rect.w - 8,
+                          rect.y + (rect.h - M5.Display.fontHeight()) / 2);
+    M5.Display.setTextDatum(TL_DATUM);
+  };
+
+  if (view == LORA_VIEW_MESSAGES) {
+    const int16_t inputH = max<int16_t>(48, static_cast<int16_t>(lineH + 12));
+    const int16_t railW = min<int16_t>(380, max<int16_t>(320, screenW * 3 / 10));
+    Rect inputRect = {12, static_cast<int16_t>(contentBottom - inputH),
+                      static_cast<int16_t>(screenW - railW - 32), inputH};
+    drawTerminalPanel(inputRect, colors.amber);
+    String inputText = loraInput.length() ? loraInput + "_" : "TYPE MESSAGE TO PUBLIC GROUP";
+    M5.Display.setTextColor(loraInput.length() ? colors.amber : colors.amberDim, colors.black);
+    M5.Display.drawString(trimToWidth(inputText, inputRect.w - 16), inputRect.x + 8,
+                          inputRect.y + (inputRect.h - M5.Display.fontHeight()) / 2);
+    return true;
+  }
+  if (view == LORA_VIEW_IDENTITY && meshIdentityField < 3) {
+    const char *labels[] = {"Name", "Short Name", "Public key"};
+    String values[] = {meshDeviceName, meshShortName, meshDeviceId};
+    if (loraInput.length()) values[meshIdentityField] = loraInput + "_";
+    drawInputRow(meshIdentityField, labels[meshIdentityField], values[meshIdentityField]);
+    return true;
+  }
+  if (view == LORA_VIEW_RADIO_EDIT) {
+    const char *labels[] = {"Frequency", "SF", "CR", "BW", "Power"};
+    String values[] = {
+        String(meshCustomNetwork.frequencyHz / 1000000.0, 3),
+        String(meshCustomNetwork.spreadingFactor),
+        String(meshCustomNetwork.displayCodingRate),
+        String(meshCustomNetwork.bandwidthKhz),
+        String(meshTxPowerDbm)};
+    if (loraInput.length()) values[meshNetworkEditField] = loraInput + "_";
+    drawInputRow(meshNetworkEditField, labels[meshNetworkEditField],
+                 values[meshNetworkEditField]);
+    return true;
+  }
+  return view == LORA_VIEW_CONTACTS || view == LORA_VIEW_DISCOVER;
+}
+
 void drawLoraApp() {
+  static LoraView lastRenderedView = LORA_VIEW_MESSAGES;
+  static bool lastRenderedViewValid = false;
   const bool contentOnly = meshContentOnlyRedraw;
+  const bool viewChanged = !lastRenderedViewValid || lastRenderedView != loraView;
   meshContentOnlyRedraw = false;
+  if (loraView == LORA_VIEW_MESSAGES && meshUnreadCount != 0) {
+    meshUnreadCount = 0;
+    meshNotificationUiDirty = true;
+    mainNavDirty = true;
+  }
+  M5.Display.startWrite();
   if (!contentOnly) drawAppTopBar("MESHCORE");
-  int16_t contentTop = static_cast<int16_t>(appTopBarRect.h + 8);
+  drawMeshStatusStrip();
+  int16_t contentTop = meshAppContentTop();
   int16_t contentBottom = static_cast<int16_t>(appPrimaryButton.y - 10);
-  M5.Display.fillRect(0, contentTop, screenW, static_cast<int16_t>(contentBottom - contentTop),
-                      colors.black);
+  if (!contentOnly || viewChanged) {
+    M5.Display.fillRect(0, contentTop, screenW,
+                        static_cast<int16_t>(contentBottom - contentTop), colors.black);
+  }
   M5.Display.setTextDatum(TL_DATUM);
   M5.Display.setTextSize(kSmallTextSize);
   int16_t lineH = static_cast<int16_t>(M5.Display.fontHeight() + 6);
@@ -23237,7 +24071,7 @@ void drawLoraApp() {
 
   if (loraView == LORA_VIEW_MESSAGES) {
     int16_t inputH = max<int16_t>(48, static_cast<int16_t>(lineH + 12));
-    int16_t railW = min<int16_t>(280, max<int16_t>(210, screenW / 3));
+    int16_t railW = min<int16_t>(380, max<int16_t>(320, screenW * 3 / 10));
     Rect inputRect = {12, static_cast<int16_t>(contentBottom - inputH),
                       static_cast<int16_t>(screenW - railW - 32), inputH};
     Rect chatRect = {12, contentTop, inputRect.w,
@@ -23289,7 +24123,7 @@ void drawLoraApp() {
     }
     if (meshPacketCount == 0) {
       M5.Display.setTextColor(colors.amberDim, colors.black);
-      M5.Display.drawString("NO PACKETS YET", chatRect.x + 6, chatRect.y + 5 + lineH);
+      M5.Display.drawString("NO MESSAGES YET", chatRect.x + 6, chatRect.y + 5 + lineH);
     }
 
     drawTerminalPanel(inputRect, colors.amber);
@@ -23303,6 +24137,16 @@ void drawLoraApp() {
     M5.Display.setTextSize(kSmallTextSize + 1);
     int16_t railLineH = static_cast<int16_t>(M5.Display.fontHeight() + 8);
     int16_t railY = railRect.y + 6;
+    auto railHeader = [&](const String &label) {
+      M5.Display.setTextSize(kSmallTextSize);
+      M5.Display.setTextColor(colors.amberDim, colors.black);
+      M5.Display.drawString(label, railRect.x + 6, railY + 4);
+      M5.Display.drawFastHLine(static_cast<int16_t>(railRect.x + 6),
+                               static_cast<int16_t>(railY + M5.Display.fontHeight() + 7),
+                               static_cast<int16_t>(railRect.w - 12), colors.amberDim);
+      railY = static_cast<int16_t>(railY + M5.Display.fontHeight() + 16);
+      M5.Display.setTextSize(kSmallTextSize + 1);
+    };
     auto railRow = [&](const String &label, bool selected, bool accent) {
       Rect r = {static_cast<int16_t>(railRect.x + 4), railY,
                 static_cast<int16_t>(railRect.w - 8), static_cast<int16_t>(railLineH + 14)};
@@ -23313,47 +24157,51 @@ void drawLoraApp() {
                             r.y + (r.h - M5.Display.fontHeight()) / 2);
       railY = static_cast<int16_t>(railY + r.h + 4);
     };
-    railRow("GROUPS", false, false);
+    railHeader("GROUPS");
     railRow("PUBLIC", meshChatSelected < 0, false);
-    railRow("CONTACTS", false, false);
+    railHeader("CONTACTS");
     for (size_t i = 0; i < meshContactCount && railY < railRect.y + railRect.h - 50; ++i) {
       const MeshContact &contact = meshContacts[i];
       railRow(contact.shortName.length() ? contact.shortName : contact.name,
               meshChatSelected == static_cast<int>(i), false);
     }
-    railRow("DISCOVER", false, true);
+    railRow("DISCOVER", meshChatSelected == static_cast<int>(meshContactCount), true);
     M5.Display.setTextSize(kSmallTextSize);
   } else if (loraView == LORA_VIEW_MENU) {
-    String labels[5] = {"Back to Chat", "Discover", "Device Identity", "Network Selection", "Contacts"};
+    String labels[6] = {"Chat", "Nearby Devices", "My Device", "Radio Network",
+                        "Transmit Power", "Saved Contacts"};
     String chatValue = "Public";
     if (meshChatSelected >= 0 && meshChatSelected < static_cast<int>(meshContactCount)) {
       chatValue = meshContacts[meshChatSelected].name;
     }
-    String values[5] = {
+    String values[6] = {
         chatValue,
-        String(meshContactCount) + " known",
+        String(meshDiscoveredCount) + " nearby",
         meshShortName,
         activeMeshNetworkPreset().name,
-        String(meshContactCount)};
-    for (int i = 0; i < 5; ++i) {
+        String(meshTxPowerDbm) + " dBm",
+        String(meshContactCount) + " saved"};
+    for (int i = 0; i < 6; ++i) {
       Rect rowRect = {40, static_cast<int16_t>(contentTop + 10 + i * meshRowStep),
                       static_cast<int16_t>(screenW - 80), meshRowH};
       drawListRow(rowRect, labels[i], values[i], i == meshMenuSelected);
     }
   } else if (loraView == LORA_VIEW_IDENTITY) {
-    String fields[5] = {
+    String fields[6] = {
         "Name",
         "Short Name",
         "Public key",
         "Auto Advert",
-        "Include location"};
-    String values[5] = {meshDeviceName, meshShortName, meshDeviceId,
+        "Include location",
+        "Telemetry sharing"};
+    String values[6] = {meshDeviceName, meshShortName, meshDeviceId,
                         meshAutoAdvert ? "ON" : "OFF",
-                        meshIncludeLocation ? "GPS" : "None"};
+                        meshIncludeLocation ? "GPS" : "None",
+                        meshTelemetryShareModeName(activeMeshTelemetryShareMode())};
     if (meshIdentityField < 3 && loraInput.length() > 0) {
       values[meshIdentityField] = loraInput;
     }
-    for (int i = 0; i < 5; ++i) {
+    for (int i = 0; i < 6; ++i) {
       Rect rowRect = {40, static_cast<int16_t>(contentTop + 10 + i * meshRowStep),
                       static_cast<int16_t>(screenW - 80), meshRowH};
       drawListRow(rowRect, fields[i], values[i], i == meshIdentityField);
@@ -23385,13 +24233,37 @@ void drawLoraApp() {
         String(meshCustomNetwork.spreadingFactor),
         String(meshCustomNetwork.displayCodingRate),
         String(meshCustomNetwork.bandwidthKhz),
-        String(meshCustomNetwork.powerDbm)};
+        String(meshTxPowerDbm)};
     if (meshNetworkEditField < 5 && loraInput.length() > 0) values[meshNetworkEditField] = loraInput;
     for (int i = 0; i < 5; ++i) {
       Rect rowRect = {40, static_cast<int16_t>(contentTop + 10 + i * meshRowStep),
                       static_cast<int16_t>(screenW - 80), meshRowH};
       drawListRow(rowRect, fields[i], values[i], i == meshNetworkEditField);
     }
+  } else if (loraView == LORA_VIEW_POWER) {
+    Rect panel = {48, static_cast<int16_t>(contentTop + 34),
+                  static_cast<int16_t>(screenW - 96), 210};
+    drawTerminalPanel(panel, colors.amber);
+    M5.Display.setTextDatum(MC_DATUM);
+    M5.Display.setTextSize(kSmallTextSize + 1);
+    M5.Display.setTextColor(colors.amber, colors.black);
+    M5.Display.drawString("TRANSMIT POWER", panel.x + panel.w / 2, panel.y + 34);
+    M5.Display.setTextSize(kSmallTextSize + 2);
+    M5.Display.drawString(String(meshTxPowerDbm) + " dBm",
+                          panel.x + panel.w / 2, panel.y + 82);
+    Rect slider = {static_cast<int16_t>(panel.x + 56), static_cast<int16_t>(panel.y + 126),
+                   static_cast<int16_t>(panel.w - 112), 26};
+    M5.Display.fillRect(slider.x, slider.y, slider.w, slider.h, colors.black);
+    M5.Display.drawRect(slider.x, slider.y, slider.w, slider.h, colors.amberDim);
+    int16_t fillW = static_cast<int16_t>(
+        (static_cast<int32_t>(slider.w - 4) * (meshTxPowerDbm - 5)) / 17);
+    M5.Display.fillRect(slider.x + 2, slider.y + 2, max<int16_t>(2, fillW),
+                        slider.h - 4, colors.amber);
+    M5.Display.setTextSize(kSmallTextSize);
+    M5.Display.setTextColor(colors.amberDim, colors.black);
+    M5.Display.drawString("5", slider.x, slider.y + slider.h + 20);
+    M5.Display.drawString("22", slider.x + slider.w, slider.y + slider.h + 20);
+    M5.Display.setTextDatum(TL_DATUM);
   } else if (loraView == LORA_VIEW_CONTACT_INFO) {
     Rect info = {24, contentTop, static_cast<int16_t>(screenW - 48),
                  static_cast<int16_t>(contentBottom - contentTop)};
@@ -23424,6 +24296,17 @@ void drawLoraApp() {
         infoLine("Pos:", "No telemetry");
       }
       infoLine("Seen:", formatMeshAge(contact.lastSeenMs));
+      infoLine("Signal:", String("RSSI ") +
+                              (contact.lastRssi.length() ? contact.lastRssi : "N/A") +
+                              "  SNR " +
+                              (contact.lastSnr.length() ? contact.lastSnr : "N/A"));
+      String batteryText = contact.battery >= 0 ? String(contact.battery) + "%" : "N/A";
+      if (contact.batteryVoltage > 0.0f) {
+        batteryText += "  " + String(contact.batteryVoltage, 2) + "V";
+      }
+      infoLine("Battery:", batteryText);
+      infoLine("Telemetry:", contact.telemetryAllowed ? "ENABLED" : "DISABLED");
+      infoLine("Map marker:", contact.showOnMap ? "VISIBLE" : "HIDDEN");
       M5.Display.setTextColor(colors.amber, colors.black);
       M5.Display.drawString("Public key:", info.x + 12, y);
       y = static_cast<int16_t>(y + lineH);
@@ -23444,7 +24327,7 @@ void drawLoraApp() {
     drawTerminalPanel(left, colors.amberDim);
     drawTerminalPanel(right, colors.amberDim);
     M5.Display.setTextColor(colors.amber, colors.black);
-    M5.Display.drawString(String("Discover (") + meshDiscoveredCount + ")", left.x + 8, left.y + 8);
+    M5.Display.drawString(String("NEARBY DEVICES  ") + meshDiscoveredCount, left.x + 8, left.y + 8);
     int peerVisible = max<int>(1, (left.h - lineH - 18) / meshRowStep);
     int peerFirst = max<int>(0, min<int>(meshContactSelected, static_cast<int>(meshDiscoveredCount)) - peerVisible + 1);
     for (int i = peerFirst; i < static_cast<int>(meshDiscoveredCount) && i < peerFirst + peerVisible; ++i) {
@@ -23456,8 +24339,15 @@ void drawLoraApp() {
       if (peer.lastRssi.length()) detail += " RSSI " + peer.lastRssi;
       drawListRow(rowRect, peer.name, detail, meshDiscoverPeerFocus && i == meshContactSelected);
     }
-    String actions[5] = {"Scan Local...", "Send ID Local", "Send ID Broadcast",
-                         "Add Selected", "Delete Old Contacts"};
+    if (meshDiscoveredCount == 0) {
+      M5.Display.setTextColor(colors.amberDim, colors.black);
+      M5.Display.drawString("No devices heard yet", left.x + 8,
+                            static_cast<int16_t>(left.y + lineH + 16));
+      M5.Display.drawString("Ask a nearby node to send ID Local", left.x + 8,
+                            static_cast<int16_t>(left.y + lineH * 2 + 20));
+    }
+    String actions[5] = {"Start Local Scan", "Share My ID Nearby", "Share My ID Network",
+                         "Save Selected Device", "Delete Stale Devices"};
     for (int i = 0; i < 5; ++i) {
       Rect rowRect = {static_cast<int16_t>(right.x + 6),
                       static_cast<int16_t>(right.y + 14 + i * meshRowStep),
@@ -23538,18 +24428,39 @@ void drawLoraApp() {
     M5.Display.setTextColor(colors.amberDim, colors.black);
     M5.Display.drawString("Tap a field, type value, tap Save",
                           appSecondaryButton.x, static_cast<int16_t>(appSecondaryButton.y + 10));
+  } else if (loraView == LORA_VIEW_POWER) {
+    drawButton(appPrimaryButton, "APPLY", colors.amber);
+    M5.Display.setTextColor(colors.amberDim, colors.black);
+    M5.Display.drawString("LEFT/RIGHT ADJUST  |  ENTER APPLY  |  ESC BACK",
+                          appSecondaryButton.x, static_cast<int16_t>(appSecondaryButton.y + 10));
   } else if (loraView == LORA_VIEW_DISCOVER) {
     M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("Tap a peer or action",
+    M5.Display.drawString("LEFT/RIGHT CHANGES PANEL  /  ENTER SELECTS",
                           appPrimaryButton.x, static_cast<int16_t>(appPrimaryButton.y + 10));
   } else if (loraView == LORA_VIEW_CONTACTS) {
     M5.Display.setTextColor(colors.amberDim, colors.black);
     M5.Display.drawString("Tap contact once to select, again for chat",
                           appPrimaryButton.x, static_cast<int16_t>(appPrimaryButton.y + 10));
   } else if (loraView == LORA_VIEW_CONTACT_INFO) {
-    drawButton(appPrimaryButton, "BACK", colors.amberDim);
-    drawButton(appSecondaryButton, "DEL", colors.redDim);
-    drawButton(appTertiaryButton, "FIND MAP", colors.amber);
+    drawButton(appPrimaryButton, "TELEMETRY", colors.amber);
+    drawButton(appSecondaryButton,
+               (meshContactSelected >= 0 &&
+                meshContactSelected < static_cast<int>(meshContactCount) &&
+                meshContacts[meshContactSelected].showOnMap)
+                   ? "MAP ON"
+                   : "MAP OFF",
+               colors.amberDim);
+    drawButton(appTertiaryButton, "BACK", colors.amberDim);
+  } else if (loraView == LORA_VIEW_TELEMETRY) {
+    drawButton(appPrimaryButton, "REFRESH", colors.amber);
+    drawButton(appSecondaryButton,
+               (meshContactSelected >= 0 &&
+                meshContactSelected < static_cast<int>(meshContactCount) &&
+                meshContacts[meshContactSelected].showOnMap)
+                   ? "MAP ON"
+                   : "MAP OFF",
+               colors.amberDim);
+    drawButton(appTertiaryButton, "BACK", colors.amberDim);
   } else {
     M5.Display.setTextColor(colors.amberDim, colors.black);
     M5.Display.drawString("Arrows select, Esc back",
@@ -23560,11 +24471,14 @@ void drawLoraApp() {
     drawBusyIndicatorTopCenter(kSmallTextSize);
   }
   M5.Display.setTextDatum(TL_DATUM);
+  M5.Display.endWrite();
+  lastRenderedView = loraView;
+  lastRenderedViewValid = true;
   waypointsDirty = false;
 }
 
 void handleLoraAppTouch(int16_t x, int16_t y) {
-  int16_t contentTop = static_cast<int16_t>(appTopBarRect.h + 8);
+  int16_t contentTop = meshAppContentTop();
   int16_t contentBottom = static_cast<int16_t>(appPrimaryButton.y - 10);
   M5.Display.setTextSize(kSmallTextSize);
   int16_t lineH = static_cast<int16_t>(M5.Display.fontHeight() + 6);
@@ -23573,7 +24487,7 @@ void handleLoraAppTouch(int16_t x, int16_t y) {
 
   if (loraView == LORA_VIEW_MESSAGES) {
     int16_t inputH = max<int16_t>(48, static_cast<int16_t>(lineH + 12));
-    int16_t railW = min<int16_t>(280, max<int16_t>(210, screenW / 3));
+    int16_t railW = min<int16_t>(380, max<int16_t>(320, screenW * 3 / 10));
     Rect inputRect = {12, static_cast<int16_t>(contentBottom - inputH),
                       static_cast<int16_t>(screenW - railW - 32), inputH};
     Rect chatRect = {12, contentTop, inputRect.w,
@@ -23581,15 +24495,29 @@ void handleLoraAppTouch(int16_t x, int16_t y) {
     Rect railRect = {static_cast<int16_t>(chatRect.x + chatRect.w + 8), contentTop, railW,
                      static_cast<int16_t>(inputRect.y + inputRect.h - contentTop)};
     if (inRect(railRect, x, y)) {
+      M5.Display.setTextSize(kSmallTextSize);
+      int16_t headerH = static_cast<int16_t>(M5.Display.fontHeight() + 16);
       M5.Display.setTextSize(kSmallTextSize + 1);
       int16_t rowH = static_cast<int16_t>(M5.Display.fontHeight() + 26);
       M5.Display.setTextSize(kSmallTextSize);
-      int row = (y - railRect.y - 6) / max<int16_t>(1, rowH);
-      if (row == 1) {
+      int16_t localY = static_cast<int16_t>(y - railRect.y - 6);
+      if (localY < headerH) return;
+      localY = static_cast<int16_t>(localY - headerH);
+      if (localY < rowH) {
         meshChatSelected = -1;
-      } else if (row >= 3 && row < 3 + static_cast<int>(meshContactCount)) {
-        meshChatSelected = row - 3;
-      } else if (row >= 3 + static_cast<int>(meshContactCount)) {
+      } else {
+        localY = static_cast<int16_t>(localY - rowH);
+        if (localY < headerH) return;
+        localY = static_cast<int16_t>(localY - headerH);
+        int row = localY / max<int16_t>(1, rowH);
+        if (row >= 0 && row < static_cast<int>(meshContactCount)) {
+          meshChatSelected = row;
+        } else {
+          meshChatSelected = static_cast<int>(meshContactCount);
+          loraView = LORA_VIEW_DISCOVER;
+        }
+      }
+      if (meshChatSelected == static_cast<int>(meshContactCount)) {
         loraView = LORA_VIEW_DISCOVER;
       }
       waypointsDirty = true;
@@ -23597,7 +24525,7 @@ void handleLoraAppTouch(int16_t x, int16_t y) {
     }
   } else if (loraView == LORA_VIEW_MENU) {
     int row = (y - contentTop - 10) / max<int16_t>(1, meshRowStep);
-    if (row >= 0 && row < 5) {
+    if (row >= 0 && row < 6) {
       meshMenuSelected = row;
       activateMeshMenuItem();
       waypointsDirty = true;
@@ -23605,13 +24533,17 @@ void handleLoraAppTouch(int16_t x, int16_t y) {
     }
   } else if (loraView == LORA_VIEW_IDENTITY) {
     int row = (y - contentTop - 10) / max<int16_t>(1, meshRowStep);
-    if (row >= 0 && row < 5) {
+    if (row >= 0 && row < 6) {
       if (row == meshIdentityField) {
         if (row == 3) {
           meshAutoAdvert = !meshAutoAdvert;
           saveMeshSettings();
         } else if (row == 4) {
           meshIncludeLocation = !meshIncludeLocation;
+          saveMeshSettings();
+        } else if (row == 5) {
+          uint8_t &mode = activeMeshTelemetryShareMode();
+          mode = static_cast<uint8_t>((mode + 1) % 3);
           saveMeshSettings();
         } else if (loraInput.length() > 0) {
           if (row == 0) meshDeviceName = loraInput;
@@ -23652,6 +24584,19 @@ void handleLoraAppTouch(int16_t x, int16_t y) {
         meshNetworkEditField = static_cast<uint8_t>(row);
         loraInput = "";
       }
+      waypointsDirty = true;
+      return;
+    }
+  } else if (loraView == LORA_VIEW_POWER) {
+    Rect panel = {48, static_cast<int16_t>(contentTop + 34),
+                  static_cast<int16_t>(screenW - 96), 210};
+    Rect sliderHit = {static_cast<int16_t>(panel.x + 40),
+                      static_cast<int16_t>(panel.y + 108),
+                      static_cast<int16_t>(panel.w - 80), 78};
+    if (inRect(sliderHit, x, y)) {
+      int value = 5 + ((x - sliderHit.x) * 17) / max<int16_t>(1, sliderHit.w);
+      meshTxPowerDbm = static_cast<uint8_t>(max<int>(5, min<int>(22, value)));
+      meshContentOnlyRedraw = true;
       waypointsDirty = true;
       return;
     }
@@ -23708,15 +24653,25 @@ void handleLoraAppTouch(int16_t x, int16_t y) {
     applyMeshIdentitySelection();
   } else if (loraView == LORA_VIEW_RADIO_EDIT && inRect(appPrimaryButton, x, y)) {
     applyMeshNetworkEditField();
+  } else if (loraView == LORA_VIEW_POWER && inRect(appPrimaryButton, x, y)) {
+    saveMeshSettings();
+    beginLoraP2pConfiguration();
+    loraStatus = "TX POWER SAVED";
+    meshContentOnlyRedraw = true;
+    waypointsDirty = true;
   } else if (loraView == LORA_VIEW_CONTACT_INFO && inRect(appPrimaryButton, x, y)) {
-    loraView = LORA_VIEW_CONTACTS;
-    loraInput = "";
+    if (requestSelectedMeshTelemetry()) loraView = LORA_VIEW_TELEMETRY;
   } else if (loraView == LORA_VIEW_CONTACT_INFO && inRect(appSecondaryButton, x, y)) {
-    deleteSelectedMeshContact();
+    toggleSelectedMeshContactMap();
+  } else if (loraView == LORA_VIEW_CONTACT_INFO && inRect(appTertiaryButton, x, y)) {
     loraView = LORA_VIEW_CONTACTS;
     loraInput = "";
-  } else if (loraView == LORA_VIEW_CONTACT_INFO && inRect(appTertiaryButton, x, y)) {
-    focusSelectedMeshContactOnMap(false);
+  } else if (loraView == LORA_VIEW_TELEMETRY && inRect(appPrimaryButton, x, y)) {
+    requestSelectedMeshTelemetry();
+  } else if (loraView == LORA_VIEW_TELEMETRY && inRect(appSecondaryButton, x, y)) {
+    toggleSelectedMeshContactMap();
+  } else if (loraView == LORA_VIEW_TELEMETRY && inRect(appTertiaryButton, x, y)) {
+    loraView = LORA_VIEW_CONTACT_INFO;
   } else if (loraView == LORA_VIEW_MESSAGES && inRect(appSecondaryButton, x, y)) {
       loraView = LORA_VIEW_MENU;
       loraInput = "";
@@ -29295,6 +30250,13 @@ void drawWaypointsScreen() {
         M5.Display.drawString("*", appButtons[slot].x + appButtons[slot].w - 8,
                               appButtons[slot].y + 4);
       }
+      if (index == kAppLoraIndex && meshUnreadCount != 0) {
+        M5.Display.setTextDatum(TR_DATUM);
+        M5.Display.setTextColor(colors.red, background);
+        M5.Display.drawString(String(meshUnreadCount),
+                              appButtons[slot].x + appButtons[slot].w - 8,
+                              appButtons[slot].y + 4);
+      }
     };
     auto drawAppMenuFooter = [&]() {
       int16_t pageCenterX = static_cast<int16_t>(
@@ -29398,7 +30360,8 @@ void drawWaypointsScreen() {
                     appSelected == kAppRecorderIndex ||
                     appSelected == kAppAudioIndex;
     if (contentH > 0) {
-      if (appSelected != kAppCameraIndex && appSelected != kAppGalleryIndex && !isSdrApp &&
+      if (appSelected != kAppCameraIndex && appSelected != kAppGalleryIndex &&
+          appSelected != kAppLoraIndex && !isSdrApp &&
           !responderAppRegistry.appByLegacyIndex(appSelected)) {
         M5.Display.fillRect(0, contentTop, screenW, contentH, colors.black);
       }
@@ -29844,10 +30807,10 @@ void drawAboutScreen() {
 
   M5.Display.setTextSize(kButtonTextSize);
   M5.Display.setTextColor(colors.amber, colors.black);
-  M5.Display.drawString("VERSION 0.71 BETA", versionPanel.x + 18, versionPanel.y + 16);
+  M5.Display.drawString("VERSION 0.72 BETA", versionPanel.x + 18, versionPanel.y + 16);
   M5.Display.setTextSize(kSmallTextSize);
   M5.Display.setTextColor(colors.amberDim, colors.black);
-  M5.Display.drawString("CURRENT FIRMWARE: RESPONDER NAV v0.71 BETA",
+  M5.Display.drawString("CURRENT FIRMWARE: RESPONDER NAV v0.72 BETA",
                         versionPanel.x + 18, versionPanel.y + 54);
   M5.Display.setTextColor(colors.amberDim, colors.black);
   M5.Display.drawString("GPL-3.0-OR-LATER | NO WARRANTY | SOURCE ON GITHUB",
@@ -33785,7 +34748,7 @@ void handleSerialDebugCommand(String line) {
     return;
   }
   if (cmd == "lora") {
-    if (arg == "ui" || arg == "status") {
+    if (arg == "ui") {
       debugPrint("MESHCORE: ui view=%u selection=%d network=%d dirty=%u content_only=%u",
                  static_cast<unsigned>(loraView), meshSelectionForView(loraView),
                  meshNetworkSelected, waypointsDirty ? 1U : 0U,
@@ -33797,6 +34760,7 @@ void handleSerialDebugCommand(String line) {
       else if (requested == "radio" || requested == "network") loraView = LORA_VIEW_RADIO;
       else if (requested == "identity") loraView = LORA_VIEW_IDENTITY;
       else if (requested == "contacts") loraView = LORA_VIEW_CONTACTS;
+      else if (requested == "telemetry") loraView = LORA_VIEW_TELEMETRY;
       else if (requested == "discover") loraView = LORA_VIEW_DISCOVER;
       else loraView = LORA_VIEW_MESSAGES;
       waypointsDirty = true;
@@ -33816,6 +34780,22 @@ void handleSerialDebugCommand(String line) {
       sendLoraTextMessage();
       debugPrint("MESHCORE: send state=%s messages=%u packets=%u", loraStatus.c_str(),
                  static_cast<unsigned>(loraMessageCount), static_cast<unsigned>(meshPacketCount));
+    } else if (arg == "telemetry" || arg == "telem") {
+      serialDebugOpenApp(kAppLoraIndex);
+      if (meshContactCount > 0) {
+        meshContactSelected =
+            max<int>(0, min<int>(meshContactSelected,
+                                static_cast<int>(meshContactCount) - 1));
+        loraView = LORA_VIEW_TELEMETRY;
+        requestSelectedMeshTelemetry();
+      } else {
+        loraStatus = "NO SAVED CONTACTS";
+      }
+      meshContentOnlyRedraw = true;
+      waypointsDirty = true;
+      debugPrint("MESHCORE: telemetry test state=%s selected=%d contacts=%u",
+                 loraStatus.c_str(), meshContactSelected,
+                 static_cast<unsigned>(meshContactCount));
     } else if (arg == "history") {
       debugPrint("MESHCORE: history messages=%u packets=%u", static_cast<unsigned>(loraMessageCount),
                  static_cast<unsigned>(meshPacketCount));
@@ -34280,14 +35260,12 @@ void setup() {
 #endif
   }
   serviceGpsInput();
-  if (!bleExclusiveBootMode && !wifiBootProfileMode) {
+  if (!bleExclusiveBootMode) {
     initLoraPortA(true);
     if (!bleExclusiveBootMode) serviceGpsInput();
     tab5MeshCoreBegin();
   } else {
-    debugPrint(bleExclusiveBootMode
-                   ? "BLE: skipping LoRa/Mesh in exclusive profile to preserve HCI DMA"
-                   : "WIFI: skipping LoRa/Mesh in Wi-Fi profile to preserve SDIO DMA");
+    debugPrint("BLE: skipping LoRa/Mesh in exclusive profile to preserve HCI DMA");
   }
   gpsKickStartMs = millis();
   debugPrint("GPS: monitor active");
@@ -34485,10 +35463,13 @@ void loop() {
   pollTab5Keyboard(now);
   updateWaypointNameEntry(now);
   updateMapKeyboardPan(now);
+  warmAdjacentMapZoomCache(millis());
   if (!bleExclusiveBootMode) {
     pollLoraPortA(now);
     tab5MeshCoreLoop(now);
   }
+  serviceMeshNotificationUi();
+  serviceLoraMessageHistorySave(now);
   updateTaskManager();
   if (screen == SCREEN_USB || usbRecoveryPhase != UsbRecoveryPhase::IDLE) {
     updateUsbRecovery(now);

@@ -1,5 +1,16 @@
 # Changelog
 
+## Responder Nav v0.72 Beta - 2026-07-27
+
+- Added reliable background MeshCore direct-message reception with unread indicators on the Apps navigation button and MeshCore app tile.
+- Added reciprocal contact telemetry requests and clipped contact-marker updates for the main map.
+- Added adjustable MeshCore transmit power and telemetry-sharing controls; public builds default telemetry sharing to off.
+- Removed synchronous MeshCore history writes from the live RX/TX path to prevent RGB display underruns and blue flashes.
+- Reworked MeshCore menu navigation and targeted redraws so selections, messages, telemetry, and discovery do not clear the full display.
+- Added a bounded adjacent-zoom tile warmer for faster map zoom changes without displacing the active map view.
+- Improved map marker cleanup, panning, menu transitions, loading screens, and UI redraw behavior.
+- Verified direct T-Deck messages, acknowledgements, telemetry requests, stable heartbeat, and healthy memory over live serial hardware testing.
+
 ## Responder Nav v0.71 Beta - 2026-07-21
 
 - Fixed extended UI stalls while traveling at road speed.
