@@ -122,7 +122,9 @@ static bool initCamera() {
   config.grab_mode = CAMERA_GRAB_LATEST;
 
   if (psramFound()) {
-    config.frame_size = FRAMESIZE_QVGA;
+    // Allocate buffers for the largest diagnostic still. The sensor is
+    // switched back to QVGA below for the normal low-latency stream.
+    config.frame_size = FRAMESIZE_UXGA;
     config.jpeg_quality = cameraQuality;
     config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM;
@@ -184,6 +186,7 @@ static void handleRoot() {
   }
   body += "</p></div><div class='card'><h3>Camera Links</h3><ul>";
   body += "<li><a href='/capture'>/capture</a> single JPEG frame</li>";
+  body += "<li><a href='/screen-capture'>/screen-capture</a> high-resolution low-exposure display frame</li>";
   body += "<li><a href='/stream'>/stream</a> MJPEG live stream</li>";
   body += "<li><a href='/status'>/status</a> status JSON</li>";
   body += "</ul></div><div class='card'><h3>Wi-Fi Setup</h3>";
@@ -191,9 +194,10 @@ static void handleRoot() {
   body += "<label>Home Wi-Fi SSID</label><br><input name='ssid' value='";
   body += htmlEscape(staSsid);
   body += "' style='width:95%'><br><label>Password</label><br>";
-  body += "<input name='pass' type='password' value='";
-  body += htmlEscape(staPass);
-  body += "' style='width:95%'><br>";
+  // Never reflect the saved credential into HTML. A masked password input is
+  // still plaintext in page source when it has a value.
+  body += "<input name='pass' type='password' value='' autocomplete='new-password' ";
+  body += "placeholder='Leave blank to keep current password' style='width:95%'><br>";
   body += "<label><input name='sta' type='checkbox' value='1' ";
   body += staEnabled ? "checked" : "";
   body += "> Also join home Wi-Fi</label><br>";
@@ -242,6 +246,12 @@ static void handleSave() {
   String ssid = server.arg("ssid");
   String pass = server.arg("pass");
   bool enableSta = server.hasArg("sta");
+  // A blank field preserves the existing credential only when the SSID is
+  // unchanged. This keeps the secret out of HTML without breaking edits to
+  // the other settings; a new SSID with a blank password remains possible.
+  if (pass.length() == 0 && ssid == staSsid) {
+    pass = staPass;
+  }
   saveSettings(ssid, pass, enableSta);
   sendCorsHeaders();
   String body = "<!doctype html><html><body style='font-family:monospace;background:#101008;color:#d8c36a'>";
@@ -289,6 +299,69 @@ static void handleCapture() {
   WiFiClient client = server.client();
   client.write(fb->buf, fb->len);
   esp_camera_fb_return(fb);
+}
+
+static void handleScreenCapture() {
+  if (!cameraReady) {
+    server.send(503, "text/plain", "camera not ready");
+    return;
+  }
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (!sensor) {
+    server.send(503, "text/plain", "sensor unavailable");
+    return;
+  }
+
+  const framesize_t oldFrameSize = sensor->status.framesize;
+  const int oldQuality = sensor->status.quality;
+  const int oldBrightness = sensor->status.brightness;
+  const int oldContrast = sensor->status.contrast;
+  const int oldAec = sensor->status.aec;
+  const int oldAecValue = sensor->status.aec_value;
+  const int oldAgc = sensor->status.agc;
+  const int oldAgcGain = sensor->status.agc_gain;
+  const int exposure = constrain(server.hasArg("exposure")
+                                     ? server.arg("exposure").toInt()
+                                     : 100,
+                                 0, 1200);
+
+  // A bright LCD in a dark room overwhelms the normal automatic exposure.
+  // Use a high-resolution, low-exposure still without slowing the live stream.
+  sensor->set_framesize(sensor, psramFound() ? FRAMESIZE_UXGA : FRAMESIZE_VGA);
+  sensor->set_quality(sensor, 6);
+  sensor->set_brightness(sensor, -2);
+  sensor->set_contrast(sensor, 2);
+  sensor->set_gain_ctrl(sensor, 0);
+  sensor->set_agc_gain(sensor, 0);
+  sensor->set_exposure_ctrl(sensor, 0);
+  sensor->set_aec_value(sensor, exposure);
+  delay(180);
+  for (int i = 0; i < 2; ++i) {
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) esp_camera_fb_return(stale);
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (fb) {
+    sendCorsHeaders();
+    server.sendHeader("Content-Disposition", "inline; filename=screen-capture.jpg");
+    server.setContentLength(fb->len);
+    server.send(200, "image/jpeg", "");
+    WiFiClient client = server.client();
+    client.write(fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+  } else {
+    server.send(503, "text/plain", "screen capture failed");
+  }
+
+  sensor->set_framesize(sensor, oldFrameSize);
+  sensor->set_quality(sensor, oldQuality);
+  sensor->set_brightness(sensor, oldBrightness);
+  sensor->set_contrast(sensor, oldContrast);
+  sensor->set_gain_ctrl(sensor, oldAgc);
+  sensor->set_agc_gain(sensor, oldAgcGain);
+  sensor->set_exposure_ctrl(sensor, oldAec);
+  sensor->set_aec_value(sensor, oldAecValue);
 }
 
 static void handleCaptureHex() {
@@ -609,6 +682,7 @@ void setup() {
   server.on("/ap-only", HTTP_GET, handleApOnly);
   server.on("/reboot", HTTP_GET, handleReboot);
   server.on("/capture", HTTP_GET, handleCapture);
+  server.on("/screen-capture", HTTP_GET, handleScreenCapture);
   server.on("/capture.hex", HTTP_GET, handleCaptureHex);
   server.on("/stream", HTTP_GET, handleStream);
   server.on("/stream.hex", HTTP_GET, handleStreamHex);
