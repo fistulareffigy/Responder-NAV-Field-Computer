@@ -5,7 +5,6 @@ for the matching source tag. Use the factory image for a fresh installation;
 the application-only image is for an existing matching bootloader and
 partition table.
 
-The local public-release staging workspace keeps the generated v0.72 Beta files
-in its sibling `firmware/` directory. Binary files are intentionally excluded
-from normal source commits so a source checkout cannot silently contain a stale
-firmware image.
+The matching v0.73 Beta binaries and checksum manifest are stored in the
+repository's capital `Firmware/` directory and are also attached to the GitHub
+prerelease. Verify the SHA-256 manifest before flashing.

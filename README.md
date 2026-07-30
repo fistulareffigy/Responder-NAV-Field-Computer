@@ -1,17 +1,18 @@
 # Responder NAV Field Computer
 
-**Responder Nav v0.72 Beta** is an expandable, offline-capable field computer for the M5Stack Tab5. It brings navigation, off-grid communications, radio utilities, vehicle diagnostics, local file transfer, and practical field tools into one landscape terminal interface.
+**Responder Nav v0.73 Beta** is an expandable, offline-capable field computer for the M5Stack Tab5. It brings navigation, off-grid communications, radio utilities, vehicle diagnostics, local file transfer, and practical field tools into one landscape terminal interface.
 
 > Beta software: test critical workflows before relying on them. Responder NAV is not emergency, life-safety, aviation, or professional vehicle-diagnostic equipment.
 
-## What changed in v0.72 Beta
+## What changed in v0.73 Beta
 
-- MeshCore direct messages, acknowledgements, discovery, and telemetry now run continuously in the background.
-- Incoming MeshCore messages add unread indicators without repainting the active app or map.
-- MeshCore history writes are removed from the live radio path to prevent RGB display underruns and blue flashes.
-- Contact telemetry markers update through clipped map regions instead of full-map redraws.
-- Adjacent zoom levels are warmed into a bounded PSRAM tile cache for faster map zooming.
-- Map panning, marker cleanup, menus, loading transitions, and app interfaces received additional redraw and responsiveness fixes.
+- Prevents the active RF/USB app from reclaiming USB while Wi-Fi is being restored.
+- Keeps the Wi-Fi restoration screen active until the device is actually reconnected.
+- Stops Deploy Cam cleanly before low-memory Wi-Fi recovery can invalidate its live socket.
+- Holds the Tab5 backlight off through managed BLE resets to hide the controller's default blue frame.
+- Refines RF Scan, MeshCore, Car Scanner, and File Manager layouts and targeted redraws.
+- Protects active map tiles from neighboring-zoom cache eviction and backs off cleanly when the map framebuffer is temporarily busy.
+- Validates four-direction map panning, key-release behavior, recenter, and zoom transitions on Tab5 hardware.
 
 ## Design philosophy
 
@@ -51,7 +52,7 @@ It is not intended to replace a smartphone, laptop, certified scanner, or SDR wo
 - USB ELM327 OBD-II diagnostics
 - Optional Freenove ESP32-WROVER Deploy Cam companion firmware
 
-Wi-Fi Motion and Wasteland Responder are intentionally excluded from v0.72 Beta. Hardware-dependent features vary with the exact module, USB adapter, antenna, hub, vehicle, region, and radio environment.
+Wi-Fi Motion and Wasteland Responder are intentionally excluded from v0.73 Beta. Hardware-dependent features vary with the exact module, USB adapter, antenna, hub, vehicle, region, and radio environment.
 
 ## Hardware
 
@@ -95,7 +96,7 @@ The release contains no personal SSID, Wi-Fi password, API key, private MeshCore
 
 ## Optional apps
 
-The v0.72 package system reads `/apps/<package>/app.json` manifests from the SD card to expose optional modules already compiled into the firmware. It does not load arbitrary native binaries from SD.
+The v0.73 package system reads `/apps/<package>/app.json` manifests from the SD card to expose optional modules already compiled into the firmware. It does not load arbitrary native binaries from SD.
 
 See [APP_DEVELOPMENT.md](APP_DEVELOPMENT.md) and [docs/external_app_packages.md](docs/external_app_packages.md).
 
@@ -112,7 +113,7 @@ The connection uses plain HTTP rather than TLS. Do not expose port 8080 to the I
 - `lib/` — project-local hardware libraries
 - `partitions/` — Tab5 partition layout
 - `sdcard/` — public-safe starter SD-card tree
-- `apps/` — optional v0.72 Beta app manifests ready to copy to SD
+- `apps/` — optional v0.73 Beta app manifests ready to copy to SD
 - `examples/` — app package examples
 - `deploy_cam_esp32cam/` — companion camera firmware
 - `firmware/` — versioned release images and checksums

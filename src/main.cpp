@@ -2395,6 +2395,7 @@ bool sdrWifiRestoreBlocking = false;
 uint32_t sdrWifiRestoreStartedMs = 0;
 uint32_t wifiRestoreModalLastDrawMs = 0;
 int8_t sdrWifiRestorePendingNav = -1;
+int8_t sdrWifiRestorePendingApp = -1;
 bool bleTransportFaulted = false;
 char bleLastStatus[96] = "NOT STARTED";
 #endif
@@ -2596,6 +2597,7 @@ M5Canvas *mapRenderCanvas = nullptr;
 int16_t mapRenderCanvasW = 0;
 int16_t mapRenderCanvasH = 0;
 bool mapRenderCanvasValid = false;
+uint32_t mapRenderCanvasRetryAfterMs = 0;
 // The landscape viewport spans as many as 5 x 4 tiles. Keep the complete
 // visible set plus a small leading edge in PSRAM so panning never thrashes the
 // PNG decoder between nine undersized cache slots.
@@ -3400,6 +3402,12 @@ void releaseSdrAppResources() {
   if (blockForWifiRestore && wifiDisabledForSdr) {
     sdrWifiRestoreBlocking = true;
     sdrWifiRestoreStartedMs = millis();
+    // Remove the SDR app from foreground ownership immediately. The current
+    // event-loop iteration can still reach app update/draw code before the
+    // blocking restore branch runs on the next iteration; leaving appSelected
+    // on RF Scan during that window re-installs the USB host we just stopped.
+    responderAppRegistry.stopByLegacyIndex(appSelected);
+    appSelected = kAppMenuIndex;
     enterWifiRestoreModal("RTL-SDR app closed");
     debugPrint("USBHOST: SDR exit Wi-Fi restore modal active");
   }
@@ -9375,6 +9383,7 @@ void updateWifiScan() {
 static bool serviceWifiPanicGuard(uint32_t now) {
 #if ENABLE_WIFI
   static uint32_t lastGuardMs = 0;
+  static uint32_t ipCamStopGraceUntilMs = 0;
   if (!wifiEnabled || !wifiAvailable || wifiTransition) {
     return true;
   }
@@ -9384,8 +9393,29 @@ static bool serviceWifiPanicGuard(uint32_t now) {
   lastGuardMs = now;
   uint32_t dma = heap_caps_get_free_size(MALLOC_CAP_DMA);
   if (dma >= kWifiRuntimePanicGuardDmaBytes) {
+    ipCamStopGraceUntilMs = 0;
     return true;
   }
+  // Never tear down the hosted Wi-Fi stack while the Deploy Cam task owns a
+  // live socket. Doing so can invalidate the NetworkClient callbacks on the
+  // other core and produce an instruction-access fault. Ask the task to close
+  // its stream first, then give it time to release the socket/DMA buffers.
+  if (ipCamLiveActive) {
+    if (!ipCamLiveStopRequested) {
+      ipCamLiveStopRequested = true;
+      ipCamStatus = "LIVE STOPPED - LOW MEMORY";
+      waypointsDirty = true;
+      debugPrint("WIFI: panic guard stopping Deploy Cam first dma=%lu",
+                 static_cast<unsigned long>(dma));
+    }
+    ipCamStopGraceUntilMs = now + 2500UL;
+    return true;
+  }
+  if (ipCamStopGraceUntilMs != 0 &&
+      static_cast<int32_t>(ipCamStopGraceUntilMs - now) > 0) {
+    return true;
+  }
+  ipCamStopGraceUntilMs = 0;
   uint32_t internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   uint32_t largest =
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -16705,6 +16735,20 @@ static MapTileCacheEntry *selectMapTileCacheEntry(int zoom, int tileX, int tileY
       slot = &entry;
       break;
     }
+    // Neighbor-zoom warming must not evict the tiles that make the visible
+    // zoom pan smoothly. Prefer replacing a non-current-zoom entry for both
+    // foreground loads and speculative warm loads, then fall back to the
+    // global LRU only when the whole cache belongs to the current zoom.
+    if (entry.zoom != mapZoom &&
+        (!slot || slot->zoom == mapZoom || entry.lastUse < slot->lastUse)) {
+      slot = &entry;
+    }
+  }
+  if (slot && slot->zoom != mapZoom) {
+    return slot;
+  }
+  slot = nullptr;
+  for (auto &entry : mapTileCache) {
     if (!slot || entry.lastUse < slot->lastUse) slot = &entry;
   }
   return slot;
@@ -20544,12 +20588,20 @@ void drawMapTiles(double centerLat, double centerLon, uint8_t zoom,
   if (mapViewMode == MapViewMode::NAV) {
     Rect view = mapPanViewportRect();
     Rect fullCanvas = {0, 0, view.w, view.h};
-    if (renderMapCanvasRegion(centerLat, centerLon, zoom, fullCanvas, true, true)) {
-      presentMapCanvas();
-      return;
+    uint32_t now = millis();
+    if (static_cast<int32_t>(now - mapRenderCanvasRetryAfterMs) >= 0) {
+      if (renderMapCanvasRegion(centerLat, centerLon, zoom, fullCanvas, true, true)) {
+        mapRenderCanvasRetryAfterMs = 0;
+        presentMapCanvas();
+        return;
+      }
+      // SD may be briefly owned by a logger or tile task. A failed 50 ms lock
+      // attempt on every redraw makes the direct fallback stutter, so back off
+      // before trying the canvas again while continuing to render the map.
+      mapRenderCanvasRetryAfterMs = now + 1200;
+      mapRenderCanvasValid = false;
+      debugPrint("MAP: framebuffer busy; direct fallback with retry backoff");
     }
-    mapRenderCanvasValid = false;
-    debugPrint("MAP: framebuffer render failed; using direct fallback");
   }
 
   double centerPx = 0.0;
@@ -23671,8 +23723,20 @@ void drawSdrAppScreen(uint8_t appIndex, const char *title) {
                            static_cast<int16_t>(screenW - 24),
                            static_cast<int16_t>(lineH * 3 + 16)};
     drawTerminalPanel(frequencyPanel, rfFrequencyEntryActive ? colors.red : colors.amber);
-    lineY = static_cast<int16_t>(frequencyPanel.y + 8);
-    drawLine(String("FREQ: ") + formatRfFrequency(rfScanFreqHz));
+    lineY = static_cast<int16_t>(frequencyPanel.y + 7);
+    M5.Display.setTextDatum(TL_DATUM);
+    M5.Display.setTextSize(kSmallTextSize);
+    M5.Display.setTextColor(colors.amberDim, colors.black);
+    M5.Display.drawString("TUNED FREQUENCY", frequencyPanel.x + 10, lineY);
+    M5.Display.setTextDatum(TR_DATUM);
+    M5.Display.setTextSize(kButtonTextSize + 1);
+    M5.Display.setTextColor(rfFrequencyEntryActive ? colors.red : colors.amber, colors.black);
+    M5.Display.drawString(
+        rfFrequencyEntryActive ? rfFrequencyInput + "_ MHz" : formatRfFrequency(rfScanFreqHz),
+        frequencyPanel.x + frequencyPanel.w - 10, lineY);
+    M5.Display.setTextDatum(TL_DATUM);
+    M5.Display.setTextSize(kSmallTextSize);
+    lineY = static_cast<int16_t>(lineY + lineH + 4);
     drawLine(droneMode ? "INDICATOR: RF ACTIVITY ONLY - NOT REMOTE ID"
                        : (rfFrequencyEntryActive
                               ? String("KEYBOARD MHz: ") + rfFrequencyInput + "_  ENTER TO TUNE"
@@ -23983,7 +24047,7 @@ static bool drawMeshTextInputDelta(LoraView view) {
 
   if (view == LORA_VIEW_MESSAGES) {
     const int16_t inputH = max<int16_t>(48, static_cast<int16_t>(lineH + 12));
-    const int16_t railW = min<int16_t>(380, max<int16_t>(320, screenW * 3 / 10));
+    const int16_t railW = min<int16_t>(430, max<int16_t>(340, screenW * 34 / 100));
     Rect inputRect = {12, static_cast<int16_t>(contentBottom - inputH),
                       static_cast<int16_t>(screenW - railW - 32), inputH};
     drawTerminalPanel(inputRect, colors.amber);
@@ -24071,7 +24135,7 @@ void drawLoraApp() {
 
   if (loraView == LORA_VIEW_MESSAGES) {
     int16_t inputH = max<int16_t>(48, static_cast<int16_t>(lineH + 12));
-    int16_t railW = min<int16_t>(380, max<int16_t>(320, screenW * 3 / 10));
+    int16_t railW = min<int16_t>(430, max<int16_t>(340, screenW * 34 / 100));
     Rect inputRect = {12, static_cast<int16_t>(contentBottom - inputH),
                       static_cast<int16_t>(screenW - railW - 32), inputH};
     Rect chatRect = {12, contentTop, inputRect.w,
@@ -25035,23 +25099,32 @@ void drawCarScannerLiveValues(bool drawFrames) {
   int16_t metricTop = static_cast<int16_t>(appTopBarRect.h + 10 + 3 * lineH + 12);
   int16_t metricGap = 8;
   int16_t metricW = static_cast<int16_t>((screenW - 24 - metricGap) / 2);
-  int16_t metricH = 58;
+  int16_t metricH = 64;
   auto drawMetric = [&](int col, int row, const char *label, const String &value, bool valid) {
     Rect rect = {static_cast<int16_t>(12 + col * (metricW + metricGap)),
                  static_cast<int16_t>(metricTop + row * (metricH + metricGap)), metricW, metricH};
     if (drawFrames) {
-      M5.Display.drawRect(rect.x, rect.y, rect.w, rect.h, colors.amberDim);
+      M5.Display.fillRect(rect.x, rect.y, rect.w, rect.h, colors.black);
+      M5.Display.drawRect(rect.x, rect.y, rect.w, rect.h,
+                          valid ? colors.amberDim : colors.redDim);
+      M5.Display.fillRect(static_cast<int16_t>(rect.x + 3),
+                          static_cast<int16_t>(rect.y + 3), 5,
+                          static_cast<int16_t>(rect.h - 6),
+                          valid ? colors.amber : colors.amberDim);
       M5.Display.setTextColor(colors.amberDim, colors.black);
       M5.Display.setTextDatum(TL_DATUM);
-      M5.Display.drawString(label, rect.x + 7, rect.y + 5);
+      M5.Display.setTextSize(kSmallTextSize);
+      M5.Display.drawString(label, rect.x + 15, rect.y + 7);
     }
-    int16_t valueX = static_cast<int16_t>(rect.x + rect.w / 2);
-    M5.Display.fillRect(valueX, static_cast<int16_t>(rect.y + 1),
-                        static_cast<int16_t>(rect.x + rect.w - valueX - 1),
-                        static_cast<int16_t>(rect.h - 2), colors.black);
+    int16_t valueX = static_cast<int16_t>(rect.x + rect.w * 42 / 100);
+    M5.Display.fillRect(valueX, static_cast<int16_t>(rect.y + 3),
+                        static_cast<int16_t>(rect.x + rect.w - valueX - 4),
+                        static_cast<int16_t>(rect.h - 6), colors.black);
     M5.Display.setTextColor(valid ? colors.amber : colors.amberDim, colors.black);
-    M5.Display.setTextDatum(TR_DATUM);
-    M5.Display.drawString(valid ? value : "N/A", rect.x + rect.w - 7, rect.y + 5);
+    M5.Display.setTextDatum(MR_DATUM);
+    M5.Display.setTextSize(kButtonTextSize);
+    M5.Display.drawString(valid ? value : "N/A", rect.x + rect.w - 12,
+                          rect.y + rect.h / 2);
   };
   drawMetric(0, 0, "RPM", String(elmLiveRpm, 0), elmLiveRpmValid);
   drawMetric(1, 0, "SPEED", String(elmLiveSpeedKmh, 0) + " KM/H", elmLiveSpeedValid);
@@ -25060,6 +25133,7 @@ void drawCarScannerLiveValues(bool drawFrames) {
   drawMetric(0, 2, "BATTERY", String(elmLiveVoltage, 1) + " V", elmLiveVoltageValid);
   drawMetric(1, 2, "GPS TRIP", tripActive ? "RECORDING" : "IDLE", true);
   M5.Display.setTextDatum(TL_DATUM);
+  M5.Display.setTextSize(kSmallTextSize);
   elmLiveUiDirty = false;
 }
 
@@ -25085,7 +25159,7 @@ void drawCarScannerApp() {
   y = static_cast<int16_t>(y + lineH + 6);
 
   int16_t metricGap = 8;
-  int16_t metricH = 58;
+  int16_t metricH = 64;
   drawCarScannerLiveValues(true);
   y = static_cast<int16_t>(y + 3 * (metricH + metricGap) + 3);
 
@@ -25993,6 +26067,10 @@ static void restartWithBlackScreen(const char *reason) {
     M5.Display.setBrightness(0);
     M5.Display.fillScreen(colors.black);
     M5.Display.display();
+    // Tab5 drives the panel backlight from GPIO22. Keep the pin physically
+    // latched off across a software reset so panel initialization cannot expose
+    // the controller's default cyan/blue framebuffer for a single frame.
+    gpio_hold_en(GPIO_NUM_22);
   }
   delay(350);
   ESP.restart();
@@ -30807,10 +30885,10 @@ void drawAboutScreen() {
 
   M5.Display.setTextSize(kButtonTextSize);
   M5.Display.setTextColor(colors.amber, colors.black);
-  M5.Display.drawString("VERSION 0.72 BETA", versionPanel.x + 18, versionPanel.y + 16);
+  M5.Display.drawString("VERSION 0.73 BETA", versionPanel.x + 18, versionPanel.y + 16);
   M5.Display.setTextSize(kSmallTextSize);
   M5.Display.setTextColor(colors.amberDim, colors.black);
-  M5.Display.drawString("CURRENT FIRMWARE: RESPONDER NAV v0.72 BETA",
+  M5.Display.drawString("CURRENT FIRMWARE: RESPONDER NAV v0.73 BETA",
                         versionPanel.x + 18, versionPanel.y + 54);
   M5.Display.setTextColor(colors.amberDim, colors.black);
   M5.Display.drawString("GPL-3.0-OR-LATER | NO WARRANTY | SOURCE ON GITHUB",
@@ -31720,16 +31798,19 @@ void drawFileManagerScreen() {
     return;
   }
   bool navigationOnly = fileManagerNavigationRedraw && !fileManagerNeedsFullRedraw;
+  Rect redrawRegion = {
+      fileMgrListRect.x, fileMgrListRect.y,
+      static_cast<int16_t>(screenW - 16 - fileMgrListRect.x), fileMgrListRect.h};
   if (navigationOnly) {
-    Rect redrawRegion = {
-        fileMgrListRect.x, fileMgrListRect.y,
-        static_cast<int16_t>(screenW - 16 - fileMgrListRect.x), fileMgrListRect.h};
     M5.Display.setClipRect(redrawRegion.x, redrawRegion.y,
                            redrawRegion.w, redrawRegion.h);
   }
   if (fileManagerNeedsFullRedraw) {
     M5.Display.fillRect(0, 0, screenW, static_cast<int16_t>(screenH - navH), colors.black);
     fileManagerNeedsFullRedraw = false;
+  } else if (navigationOnly) {
+    M5.Display.fillRect(redrawRegion.x, redrawRegion.y,
+                        redrawRegion.w, redrawRegion.h, colors.black);
   } else {
     M5.Display.fillRect(0, 0, screenW, static_cast<int16_t>(screenH - navH), colors.black);
   }
@@ -31746,21 +31827,26 @@ void drawFileManagerScreen() {
   M5.Display.drawString("PATH", static_cast<int16_t>(pathRect.x + 10),
                         static_cast<int16_t>(pathRect.y + pathRect.h / 2));
   M5.Display.setTextColor(colors.amber, colors.black);
-  M5.Display.drawString(fileManagerPath, static_cast<int16_t>(pathRect.x + 76),
+  String shownPath = fileManagerPath;
+  int16_t pathAvailable = static_cast<int16_t>(pathRect.w - 76 - 190);
+  while (shownPath.length() > 1 && M5.Display.textWidth(shownPath) > pathAvailable) {
+    shownPath.remove(0, 1);
+  }
+  if (shownPath != fileManagerPath) shownPath = String("...") + shownPath;
+  M5.Display.drawString(shownPath, static_cast<int16_t>(pathRect.x + 76),
                         static_cast<int16_t>(pathRect.y + pathRect.h / 2));
 
   M5.Display.setTextDatum(MR_DATUM);
-  M5.Display.setTextColor(sdReady ? colors.amber : colors.red, colors.black);
-  M5.Display.drawString(sdReady ? "SD ONLINE" : "SD OFFLINE",
+  const bool showTransientStatus =
+      fileManagerStatus.length() > 0 && millis() - fileManagerStatusMs < 5000;
+  M5.Display.setTextColor(showTransientStatus ? colors.red
+                                               : (sdReady ? colors.amber : colors.red),
+                          colors.black);
+  M5.Display.drawString(showTransientStatus ? fileManagerStatus
+                                            : (sdReady ? String("SD ONLINE")
+                                                       : String("SD OFFLINE")),
                         static_cast<int16_t>(pathRect.x + pathRect.w - 10),
                         static_cast<int16_t>(pathRect.y + pathRect.h / 2));
-
-  if (fileManagerStatus.length() > 0 && millis() - fileManagerStatusMs < 5000) {
-    M5.Display.setTextDatum(TR_DATUM);
-    M5.Display.setTextColor(colors.red, colors.black);
-    M5.Display.drawString(fileManagerStatus, static_cast<int16_t>(pathRect.x + pathRect.w - 10),
-                          static_cast<int16_t>(pathRect.y + pathRect.h / 2));
-  }
 
   bool listReady = !usbMscActive && sdReady;
   if (listReady && fileManagerListDirty) {
@@ -33799,6 +33885,14 @@ bool serialDebugLeaveCurrentApp(uint8_t nextApp) {
         nextApp == kAppRfScanIndex || nextApp == kAppDroneIndex)) {
     releaseSdrAppResources();
     if (sdrWifiRestoreBlocking) {
+      // Serial acceptance navigation must obey the same deferred handoff as
+      // the physical nav bar. Otherwise appSelected remains on RF Scan and
+      // immediately reclaims USB as soon as the restore modal closes.
+      if (nextApp == kAppMenuIndex) {
+        sdrWifiRestorePendingNav = 1;
+      } else {
+        sdrWifiRestorePendingApp = static_cast<int8_t>(nextApp);
+      }
       return true;
     }
   }
@@ -35039,6 +35133,12 @@ void processSerialDebugCommands() {
 }
 
 void setup() {
+  // On cold boot, turn the Tab5 backlight off before any display-library work.
+  // After a managed restart GPIO22 may still be held low by
+  // restartWithBlackScreen(); configuring it here prepares the state that will
+  // take effect when the hold is released after the first black frame.
+  gpio_set_direction(GPIO_NUM_22, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_22, 0);
   prepareCrashCapture();
 #if HAS_USB_JTAG_CMDS
   if (usb_serial_jtag_is_driver_installed()) {
@@ -35072,12 +35172,18 @@ void setup() {
   auto cfg = M5.config();
   cfg.serial_baudrate = 0;
   cfg.internal_imu = kCompassFeatureEnabled;
+  // M5.begin restores the brightness value captured before display init. Set
+  // that value to zero first so the RGB panel cannot expose its blue/default
+  // framebuffer between panel init and our first black frame.
+  M5.Display.setBrightness(0);
   M5.begin(cfg);
   // M5.begin can briefly expose the controller's blue/default framebuffer.
   // Blank it before power and peripheral setup so every reboot transition stays black.
   M5.Display.setBrightness(0);
   M5.Display.fillScreen(TFT_BLACK);
   M5.Display.display();
+  gpio_hold_dis(GPIO_NUM_22);
+  M5.Display.setBrightness(0);
   M5.Power.setExtOutput(true);
   M5.Power.setExtOutput(true, m5::ext_port_mask_t::ext_USB);
   delay(50);
@@ -35330,12 +35436,24 @@ void setup() {
 static void finishSdrWifiRestoreNavigation() {
   int8_t target = sdrWifiRestorePendingNav;
   sdrWifiRestorePendingNav = -1;
-  if (target < 0) return;
+  int8_t pendingApp = sdrWifiRestorePendingApp;
+  sdrWifiRestorePendingApp = -1;
+  if (target < 0 && pendingApp < 0) return;
 
   responderAppRegistry.stopByLegacyIndex(appSelected);
+  appSelected = kAppMenuIndex;
+  if (pendingApp >= 0) {
+    beginMenuTransition(true);
+    screen = SCREEN_WAYPOINTS;
+    openApp(static_cast<uint8_t>(pendingApp));
+    uiDrawBusyUntilMs = 0;
+    uiDrawBusyClearing = false;
+    lastUiDraw = 0;
+    debugPrint("USBHOST: completed deferred SDR app=%d", static_cast<int>(pendingApp));
+    return;
+  }
   if (target == 0) {
     mapViewMode = MapViewMode::NAV;
-    appSelected = kAppMenuIndex;
     enterMapScreen();
   } else if (target == 1) {
     beginMenuTransition(true);
@@ -35437,7 +35555,7 @@ void loop() {
     updateWifiTransition(now);
     bool wifiBack = !wifiDisabledForSdr && wifiEnabled && wifiAvailable &&
                     WiFi.status() == WL_CONNECTED;
-    if (wifiBack || (!wifiDisabledForSdr && !wifiBootEnablePending)) {
+    if (wifiBack) {
       sdrWifiRestoreBlocking = false;
       sdrWifiRestoreStartedMs = 0;
       wifiRestoreModalLastDrawMs = 0;
@@ -35454,6 +35572,7 @@ void loop() {
       sdrWifiRestoreBlocking = false;
       sdrWifiRestoreStartedMs = 0;
       sdrWifiRestorePendingNav = -1;
+      sdrWifiRestorePendingApp = -1;
       requestWifiBoot(true);
     }
     return;
