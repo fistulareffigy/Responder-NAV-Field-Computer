@@ -14,6 +14,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Public-release privacy gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -I -n -E \
+            'C:[/\\]Users[/\\]|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[opusr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}' \
+            -- src include apps sdcard deploy_cam_esp32cam platformio.ini; then
+            echo "Public tree contains a credential or personal-path marker."
+            exit 1
+          fi
+          forbidden="$(git ls-files | grep -Ei '(^|/)(tile_key\.txt|wifi_secrets\.h|\.env|.*\.(pem|p12|pfx))$' || true)"
+          if [[ -n "$forbidden" ]]; then
+            echo "Local credential files are tracked:"
+            echo "$forbidden"
+            exit 1
+          fi
       - name: Install PlatformIO
         run: pip install platformio
       - name: Build Responder Nav

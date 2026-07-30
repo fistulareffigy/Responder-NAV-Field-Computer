@@ -1,0 +1,4 @@
+be79750e6101434496420667addf4a6362c0da5a62d90be8cdbb1574e01744b9  Deploy-Cam-v0.73-Beta-Freenove-app.bin
+db96dbfc55a7d0598b121c9a252529abd57c05b93bfbae91509216ffc33e875a  Deploy-Cam-v0.73-Beta-Freenove-factory.bin
+95e5572acb761bc5bfea646b4f2203ddf0153f5d66bdd23c82c664ba4c3e558e  Responder-Nav-v0.73-Beta-app.bin
+06fdbd851ee4b75bddc0d1cf046a3d89c68d7fbc5ca22ce55929cf133e57055d  Responder-Nav-v0.73-Beta-factory.bin

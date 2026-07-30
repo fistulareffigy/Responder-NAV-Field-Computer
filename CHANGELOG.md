@@ -1,5 +1,16 @@
 # Changelog
 
+## Responder Nav v0.73 Beta - 2026-07-30
+
+- Fixed RF/USB exit handoff so the foreground app cannot reclaim USB while Wi-Fi restoration is still in progress.
+- Required a real Wi-Fi connection before dismissing the restoration screen and added deferred app navigation after restoration.
+- Prevented Deploy Cam low-memory recovery from tearing down Wi-Fi while the live stream task still owns its socket.
+- Held the Tab5 backlight off across managed BLE resets to suppress the controller's brief default blue frame.
+- Polished the RF Scan frequency panel, MeshCore contact rail, Car Scanner metrics, and File Manager navigation redraws.
+- Protected active-zoom map tiles from speculative neighboring-zoom cache eviction and added framebuffer retry backoff.
+- Hardware-tested map panning in four directions, key release without continued drift, recenter, and zoom 14 to 15 to 14.
+- Repeated the public-source, Git-history, and release-binary privacy scan before publication.
+
 ## Responder Nav v0.72 Beta - 2026-07-27
 
 - Added reliable background MeshCore direct-message reception with unread indicators on the Apps navigation button and MeshCore app tile.
