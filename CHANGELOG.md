@@ -2,6 +2,9 @@
 
 ## Responder Nav v0.73 Beta - 2026-07-30
 
+- Corrected Wi-Fi clock synchronization so a plausible but stale cached epoch cannot be mistaken for a fresh SNTP update.
+- Made the map sidebar use the same validated, advancing local clock as Calendar instead of an invalid GPS time field.
+- Matched the initial atomic Apps-menu footer texture to subsequent page redraws so its dotted pattern appears immediately.
 - Fixed RF/USB exit handoff so the foreground app cannot reclaim USB while Wi-Fi restoration is still in progress.
 - Required a real Wi-Fi connection before dismissing the restoration screen and added deferred app navigation after restoration.
 - Prevented Deploy Cam low-memory recovery from tearing down Wi-Fi while the live stream task still owns its socket.
