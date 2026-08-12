@@ -97,6 +97,7 @@ static inline const char *vba_embed_core_name(void) { return "GBA REMOVED"; }
 #endif
 #if ENABLE_WIFI
 #include <WiFi.h>
+#include <esp_sntp.h>
 #include <ESP_HostedOTA.h>
 #include <esp32-hal-hosted.h>
 #include <esp_wifi.h>
@@ -2647,6 +2648,8 @@ bool clockHasGps = false;
 bool clockHasNtp = false;
 bool ntpConfigured = false;
 uint32_t lastNtpCheckMs = 0;
+volatile bool ntpSyncReceived = false;
+volatile uint32_t ntpSyncEpoch = 0;
 int mapDownloadScroll = 0;
 int clockOffsetHours = 0;
 bool clockOffsetValid = false;
@@ -2661,6 +2664,13 @@ static void applyValidatedSystemEpoch(uint32_t epoch) {
   tv.tv_usec = 0;
   settimeofday(&tv, nullptr);
 }
+#if ENABLE_WIFI
+static void onNtpTimeSync(struct timeval *tv) {
+  if (!tv || tv->tv_sec < 1577836800LL || tv->tv_sec >= 2524608000LL) return;
+  ntpSyncEpoch = static_cast<uint32_t>(tv->tv_sec);
+  ntpSyncReceived = true;
+}
+#endif
 uint32_t lastGpsClockSyncMs = 0;
 uint32_t lastGpsClockAttemptMs = 0;
 uint32_t lastGpsClockRejectLogMs = 0;
@@ -9053,20 +9063,9 @@ bool connectToNetwork(const String &ssid, const String &pass) {
       // Trigger NTP config immediately after connect to speed sync
       ntpConfigured = false;
       lastNtpCheckMs = millis();
-      // Quick epoch check — may still be 0 until SNTP finishes
-      time_t epoch = time(nullptr);
-      if (epoch >= 1577836800LL && epoch < 2524608000LL) {
-        clockHasNtp = true;
-        wifiTimeSyncPending = false;
-        cachedEpochSeconds = static_cast<uint32_t>(epoch);
-        cachedEpochValid = true;
-        cachedEpochSetMs = millis();
-        applyValidatedSystemEpoch(static_cast<uint32_t>(epoch));
-      } else {
-        // A stale/corrupt RTC value (including the observed year 2100) must not
-        // suppress the actual SNTP request after association.
-        wifiTimeSyncPending = true;
-      }
+      // A restored clock value can be plausible but stale. Only a completed
+      // SNTP callback may authenticate a fresh network-time update.
+      wifiTimeSyncPending = true;
       return true;
     }
     delay(50);
@@ -18688,34 +18687,14 @@ void drawStatusPanel() {
   y += lineH;
 
   uint32_t nowMs = millis();
-  if (gps.time.isValid()) {
-    clockBaseSeconds = static_cast<uint32_t>(gps.time.hour()) * 3600UL +
-                       static_cast<uint32_t>(gps.time.minute()) * 60UL +
-                       static_cast<uint32_t>(gps.time.second());
-    clockBaseMs = nowMs;
-    clockHasGps = true;
-  }
   char timeBuf[16] = {0};
-  int32_t offsetSeconds = clockOffsetValid ? clockOffsetHours * 3600 : 0;
-  if (clockHasGps) {
-    uint32_t elapsed = (nowMs - clockBaseMs) / 1000UL;
-    int64_t seconds = static_cast<int64_t>(clockBaseSeconds) + static_cast<int64_t>(elapsed) +
-                      static_cast<int64_t>(offsetSeconds);
-    seconds %= 86400;
-    if (seconds < 0) {
-      seconds += 86400;
-    }
+  tm localTm{};
+  if (getLocalTimeTm(localTm)) {
+    uint32_t seconds = static_cast<uint32_t>(localTm.tm_hour) * 3600UL +
+                       static_cast<uint32_t>(localTm.tm_min) * 60UL +
+                       static_cast<uint32_t>(localTm.tm_sec);
     formatHm12(seconds, timeBuf, sizeof(timeBuf));
     snprintf(lineBuf, sizeof(lineBuf), "TIME %s", timeBuf);
-  } else if (clockHasNtp) {
-    time_t epoch = time(nullptr);
-    epoch += offsetSeconds;
-    if (formatEpochHm12(epoch, timeBuf, sizeof(timeBuf))) {
-      snprintf(lineBuf, sizeof(lineBuf), "TIME %s", timeBuf);
-    } else {
-      formatHms(nowMs / 1000UL, false, timeBuf, sizeof(timeBuf));
-      snprintf(lineBuf, sizeof(lineBuf), "UP %s", timeBuf);
-    }
   } else {
     formatHms(nowMs / 1000UL, false, timeBuf, sizeof(timeBuf));
     snprintf(lineBuf, sizeof(lineBuf), "UP %s", timeBuf);
@@ -30137,6 +30116,21 @@ static void drawAtomicMenuHeader(M5Canvas &canvas, const char *title, int16_t he
   canvas.drawString(title, 12, static_cast<int16_t>(headerH / 2 - 1));
 }
 
+static void drawAtomicTextureRect(M5Canvas &canvas, const Rect &r, int16_t step = 8,
+                                  int16_t dot = 2) {
+  if (r.w <= 0 || r.h <= 0) return;
+  int16_t x0 = max<int16_t>(0, r.x);
+  int16_t y0 = max<int16_t>(0, r.y);
+  int16_t x1 = min<int16_t>(screenW, static_cast<int16_t>(r.x + r.w));
+  int16_t y1 = min<int16_t>(screenH, static_cast<int16_t>(r.y + r.h));
+  if (x1 - x0 < 2 || y1 - y0 < 2) return;
+  for (int16_t ty = static_cast<int16_t>(y0 + 2); ty <= y1 - 2; ty += step) {
+    for (int16_t tx = static_cast<int16_t>(x0 + 2); tx <= x1 - 2; tx += step) {
+      canvas.fillRect(tx, ty, dot, dot, colors.amberDim);
+    }
+  }
+}
+
 static void drawAtomicNavBar(M5Canvas &canvas, uint8_t activeIndex) {
   const char *labels[4] = {"MAP", "APPS", "UTILITIES", "LOCK"};
   for (uint8_t i = 0; i < 4; ++i) {
@@ -30198,6 +30192,7 @@ static bool composeAppsMenuFrame() {
       (appMenuPrevPageButton.x + appMenuPrevPageButton.w + appMenuNextPageButton.x) / 2);
   int16_t pageCenterY = static_cast<int16_t>(appMenuPrevPageButton.y + appMenuPrevPageButton.h / 2);
   canvas.fillRect(0, footerY, screenW, footerH, colors.black);
+  drawAtomicTextureRect(canvas, {0, footerY, screenW, footerH});
   canvas.drawFastHLine(0, footerY, screenW, colors.amberDim);
   canvas.drawRect(appMenuPrevPageButton.x, appMenuPrevPageButton.y,
                   appMenuPrevPageButton.w, appMenuPrevPageButton.h, colors.amber);
@@ -35873,19 +35868,29 @@ void loop() {
     }
     if (wifiEnabled && wifiAvailable && WiFi.status() == WL_CONNECTED && wifiTimeSyncPending) {
       if (!ntpConfigured) {
+        ntpSyncReceived = false;
+        ntpSyncEpoch = 0;
+        esp_sntp_set_time_sync_notification_cb(onNtpTimeSync);
         configTime(0, 0, "pool.ntp.org", "time.nist.gov");
         ntpConfigured = true;
         lastNtpCheckMs = now;
+        debugPrint("CLOCK: SNTP request started");
       }
       if (now - lastNtpCheckMs >= kNtpCheckMs) {
-        time_t epoch = time(nullptr);
-        if (epoch >= 1577836800LL && epoch < 2524608000LL) {
-          clockHasNtp = true;
-          wifiTimeSyncPending = false;
-          cachedEpochSeconds = static_cast<uint32_t>(epoch);
-          cachedEpochValid = true;
-          cachedEpochSetMs = now;
-          applyValidatedSystemEpoch(static_cast<uint32_t>(epoch));
+        if (ntpSyncReceived) {
+          uint32_t epoch = ntpSyncEpoch;
+          ntpSyncReceived = false;
+          if (epoch >= 1577836800UL && epoch < 2524608000UL) {
+            clockHasNtp = true;
+            wifiTimeSyncPending = false;
+            cachedEpochSeconds = epoch;
+            cachedEpochValid = true;
+            cachedEpochSetMs = now;
+            applyValidatedSystemEpoch(epoch);
+            debugPrint("CLOCK: SNTP sync accepted epoch=%lu offset=%d",
+                       static_cast<unsigned long>(epoch),
+                       clockOffsetValid ? clockOffsetHours : 0);
+          }
         }
         lastNtpCheckMs = now;
       }
