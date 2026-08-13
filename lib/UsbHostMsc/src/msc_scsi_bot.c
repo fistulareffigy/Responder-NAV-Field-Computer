@@ -333,7 +333,7 @@ esp_err_t scsi_cmd_read10(msc_host_device_handle_t dev,
         .length = __builtin_bswap16(num_sectors),
     };
 
-    esp_err_t ret = bot_execute_command(device, &cbw.base, data, num_sectors * sector_size);
+    esp_err_t ret = bot_execute_command(device, &cbw.base, data, (size_t)num_sectors * sector_size);
 
     // In case of an error, get an error code
     if (unlikely(ret != ESP_OK)) {
@@ -360,7 +360,7 @@ esp_err_t scsi_cmd_write10(msc_host_device_handle_t dev,
         .length = __builtin_bswap16(num_sectors),
     };
 
-    esp_err_t ret = bot_execute_command(device, &cbw.base, (void *)data, num_sectors * sector_size);
+    esp_err_t ret = bot_execute_command(device, &cbw.base, (void *)data, (size_t)num_sectors * sector_size);
 
     // In case of an error, get an error code
     if (unlikely(ret != ESP_OK)) {
