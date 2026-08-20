@@ -6,6 +6,7 @@
 - Replaced the blocking saved-network reconnect loop with responsive asynchronous Wi-Fi enable and bounded per-network attempts.
 - Made the last successful saved network the preferred target after Wi-Fi is disabled and re-enabled.
 - Added an immediate `ENABLING WIFI` state so the Wi-Fi Control screen remains responsive during radio startup.
+- Re-ran the public privacy gate, CodeQL analysis, credential/path checks, and release-binary marker scan; no private credentials or development-only identifiers were detected.
 
 ## Responder Nav v0.73 Beta - 2026-07-30
 
