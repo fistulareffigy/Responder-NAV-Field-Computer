@@ -1,5 +1,12 @@
 # Changelog
 
+## Responder Nav v0.73 Beta maintenance update - 2026-08-20
+
+- Fixed intermittent Wi-Fi scans by waiting for the ESP-Hosted scan-complete event and clearing stale driver scan state between attempts.
+- Replaced the blocking saved-network reconnect loop with responsive asynchronous Wi-Fi enable and bounded per-network attempts.
+- Made the last successful saved network the preferred target after Wi-Fi is disabled and re-enabled.
+- Added an immediate `ENABLING WIFI` state so the Wi-Fi Control screen remains responsive during radio startup.
+
 ## Responder Nav v0.73 Beta - 2026-07-30
 
 - Corrected Wi-Fi clock synchronization so a plausible but stale cached epoch cannot be mistaken for a fresh SNTP update.
