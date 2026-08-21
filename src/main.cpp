@@ -76,6 +76,7 @@ static inline const char *vba_embed_core_name(void) { return "GBA REMOVED"; }
 #include <esp_sccb_i2c.h>
 #include <sc202cs.h>
 #include "lock_screen_art.h"
+#include "security_certs.h"
 #include "usb_host_manager.h"
 #ifdef FILE_READ
 #undef FILE_READ
@@ -390,6 +391,7 @@ constexpr uint32_t kWifiScanIntervalMs = 15000;
 constexpr uint32_t kWifiScanTimeoutMs = 15000;
 constexpr uint32_t kWifiToggleCooldownMs = 1500;
 constexpr uint32_t kWifiTransitionHoldMs = 1200;
+constexpr uint32_t kWifiAsyncConnectTimeoutMs = 8000;
 constexpr bool kWifiAllowHardDisable = false;
 constexpr bool kHostedWifiRuntimeSafe = false;
 constexpr int16_t kMapDlArrowPad = 4;
@@ -932,6 +934,14 @@ int wifiNetworkCount = 0;
 bool wifiScanInProgress = false;
 uint32_t wifiScanStartedMs = 0;
 uint32_t lastWifiScanMs = 0;
+volatile bool wifiScanDriverDone = false;
+bool wifiScanEventRegistered = false;
+bool wifiEnableReconnectSequence = false;
+bool wifiAsyncReconnectActive = false;
+uint32_t wifiAsyncReconnectStartedMs = 0;
+size_t wifiAsyncReconnectCycleAttempts = 0;
+size_t wifiAsyncReconnectCurrentIndex = 0;
+size_t wifiAsyncReconnectIndex = 0;
 
 WifiCred savedCreds[kMaxSavedNetworks];
 size_t savedCredCount = 0;
@@ -4421,8 +4431,6 @@ void setWifiEnabled(bool enabled) {
       debugPrint("WIFI: mode OK");
       debugPrint("WIFI: freeHeap after mode %u", static_cast<unsigned>(ESP.getFreeHeap()));
       wifiDirty = true;
-      // allow hosted SDIO tasks to stabilize before initiating network traffic
-      delay(500);
       {
         uint32_t postModeInternal =
             heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -4447,11 +4455,24 @@ void setWifiEnabled(bool enabled) {
           goto done;
         }
       }
-      debugPrint("WIFI: delaying before autoConnect");
-      delay(1000);
-      autoConnectWifi();
+      wifiEnableReconnectSequence = savedCredCount > 0;
+      wifiAsyncReconnectActive = false;
+      wifiAsyncReconnectStartedMs = 0;
+      wifiAsyncReconnectCycleAttempts = 0;
+      wifiLastAutoConnectAttemptMs = millis();
+      debugPrint("WIFI: async enable ready saved=%u",
+                 static_cast<unsigned>(savedCredCount));
     }
   } else {
+    if (WiFi.status() == WL_CONNECTED) {
+      String connectedSsid = WiFi.SSID();
+      for (size_t i = 0; i < savedCredCount; ++i) {
+        if (savedCreds[i].ssid == connectedSsid) {
+          wifiAsyncReconnectIndex = i;
+          break;
+        }
+      }
+    }
     abortTileDownload();
     if (mapDownload.active) {
       stopMapDownload();
@@ -4470,6 +4491,10 @@ void setWifiEnabled(bool enabled) {
     wifiEnabled = false;
     wifiScanInProgress = false;
     wifiNetworkCount = 0;
+    wifiEnableReconnectSequence = false;
+    wifiAsyncReconnectActive = false;
+    wifiAsyncReconnectStartedMs = 0;
+    wifiAsyncReconnectCycleAttempts = 0;
     wifiDirty = true;
   }
 done:
@@ -5113,8 +5138,9 @@ void loadTileServer() {
       applyTileStyle(false);
     }
   }
-  debugPrint("TILES: server=%s style=%s key=%d", tileServerBase.c_str(), tileServerStyle.c_str(),
-             tileServerKey.length() > 0 ? 1 : 0);
+  debugPrint("TILES: configured=%u style=%s key=%u",
+             tileServerBase.length() > 0 ? 1U : 0U, tileServerStyle.c_str(),
+             tileServerKey.length() > 0 ? 1U : 0U);
   unlockSd();
 }
 
@@ -9106,12 +9132,13 @@ void autoConnectWifi() {
 // Routine recovery must never wait in the UI loop. Initial boot and explicit
 // Wi-Fi screens retain their loading UI, while background recovery starts one
 // saved credential and returns immediately.
-static size_t wifiAsyncReconnectIndex = 0;
-
-static void beginAsyncWifiReconnect() {
+static bool beginAsyncWifiReconnect() {
 #if ENABLE_WIFI
   wifiLastAutoConnectAttemptMs = millis();
-  if (savedCredCount == 0 || wifiScanInProgress || wifiTransition) return;
+  if (savedCredCount == 0 || wifiScanInProgress || wifiTransition ||
+      wifiAsyncReconnectActive) {
+    return false;
+  }
   for (size_t checked = 0; checked < savedCredCount; ++checked) {
     size_t index = wifiAsyncReconnectIndex++ % savedCredCount;
     if (savedCreds[index].ssid.length() == 0) continue;
@@ -9120,13 +9147,18 @@ static void beginAsyncWifiReconnect() {
     WiFi.setAutoReconnect(true);
     WiFi.disconnect(false, false);
     WiFi.begin(savedCreds[index].ssid.c_str(), savedCreds[index].pass.c_str());
+    wifiAsyncReconnectCurrentIndex = index;
+    wifiAsyncReconnectActive = true;
+    wifiAsyncReconnectStartedMs = millis();
+    ++wifiAsyncReconnectCycleAttempts;
     wifiStatusDirty = true;
     debugPrint("WIFI: async reconnect started index=%u/%u",
                static_cast<unsigned>(index + 1),
                static_cast<unsigned>(savedCredCount));
-    return;
+    return true;
   }
 #endif
+  return false;
 }
 
 static bool hostedRadioHeavyOwnerActive() {
@@ -9174,7 +9206,7 @@ static bool hostedRadioCanWifiScan() {
   }
 #endif
   uint32_t now = millis();
-  if (lastWifiScanMs != 0 && now - lastWifiScanMs < 10000UL) {
+  if (lastWifiScanMs != 0 && now - lastWifiScanMs < 1500UL) {
     debugPrint("RADIO: Wi-Fi scan blocked cooldown");
     return false;
   }
@@ -9182,6 +9214,12 @@ static bool hostedRadioCanWifiScan() {
 #else
   return false;
 #endif
+}
+
+static void onWifiScanDoneEvent(arduino_event_id_t event) {
+  if (event == ARDUINO_EVENT_WIFI_SCAN_DONE) {
+    wifiScanDriverDone = true;
+  }
 }
 
 static bool prepareWifiForManualScan() {
@@ -9268,16 +9306,28 @@ void startWifiScan() {
   }
   if (!prepareWifiForManualScan() || !hostedRadioCanWifiScan()) {
     wifiScanInProgress = false;
-    lastWifiScanMs = millis();
     wifiStatusDirty = true;
     wifiListDirty = true;
     debugPrint("WIFI: lightweight scan blocked unsafe resources");
     return;
   }
+  if (!wifiScanEventRegistered) {
+    WiFi.onEvent(onWifiScanDoneEvent, ARDUINO_EVENT_WIFI_SCAN_DONE);
+    wifiScanEventRegistered = true;
+  }
   wifiNetworkCount = 0;
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
+  bool wifiScanWasConnected = WiFi.status() == WL_CONNECTED;
+  WiFi.setAutoReconnect(false);
+  if (!wifiScanWasConnected) {
+    WiFi.disconnect(false, false);
+    delay(80);
+  }
+  esp_wifi_scan_stop();
+  esp_wifi_clear_ap_list();
+  delay(20);
+  wifiScanDriverDone = false;
   wifi_scan_config_t config = {};
   config.show_hidden = true;
   config.scan_type = WIFI_SCAN_TYPE_ACTIVE;
@@ -9285,8 +9335,10 @@ void startWifiScan() {
   config.scan_time.active.max = 180;
   esp_err_t err = esp_wifi_scan_start(&config, false);
   if (err != ESP_OK) {
+    esp_wifi_scan_stop();
+    esp_wifi_clear_ap_list();
+    WiFi.setAutoReconnect(true);
     wifiScanInProgress = false;
-    lastWifiScanMs = millis();
     wifiStatusDirty = true;
     wifiListDirty = true;
     debugPrint("WIFI: lightweight scan start failed err=%d status=%d internal=%u dma=%u",
@@ -9307,12 +9359,11 @@ void startWifiScan() {
 
 void stopWifiScan() {
 #if ENABLE_WIFI
-  if (!wifiScanInProgress) {
-    return;
-  }
   esp_wifi_scan_stop();
   esp_wifi_clear_ap_list();
+  wifiScanDriverDone = false;
   wifiScanInProgress = false;
+  WiFi.setAutoReconnect(true);
   wifiStatusDirty = true;
   wifiListDirty = true;
 #endif
@@ -9323,13 +9374,15 @@ void updateWifiScan() {
   if (!wifiScanInProgress) {
     return;
   }
-  if (millis() - wifiScanStartedMs < 3500UL) {
+  if (!wifiScanDriverDone && millis() - wifiScanStartedMs <= kWifiScanTimeoutMs) {
     return;
   }
-  if (millis() - wifiScanStartedMs > kWifiScanTimeoutMs) {
+  if (!wifiScanDriverDone) {
     esp_wifi_scan_stop();
     esp_wifi_clear_ap_list();
+    wifiScanDriverDone = false;
     wifiScanInProgress = false;
+    WiFi.setAutoReconnect(true);
     wifiStatusDirty = true;
     wifiListDirty = true;
     debugPrint("WIFI: lightweight scan timeout status=%d", static_cast<int>(WiFi.status()));
@@ -9338,7 +9391,11 @@ void updateWifiScan() {
   uint16_t apCount = 0;
   esp_err_t numErr = esp_wifi_scan_get_ap_num(&apCount);
   if (numErr != ESP_OK) {
+    esp_wifi_scan_stop();
+    esp_wifi_clear_ap_list();
+    wifiScanDriverDone = false;
     wifiScanInProgress = false;
+    WiFi.setAutoReconnect(true);
     wifiStatusDirty = true;
     wifiListDirty = true;
     debugPrint("WIFI: lightweight scan ap_num err=%d status=%d", static_cast<int>(numErr),
@@ -9366,6 +9423,7 @@ void updateWifiScan() {
     ++wifiNetworkCount;
   }
   esp_wifi_clear_ap_list();
+  wifiScanDriverDone = false;
   wifiScanInProgress = false;
   lastWifiScanMs = millis();
   wifiStatusDirty = true;
@@ -10378,7 +10436,7 @@ bool fetchWeather(double lat, double lon, float &tempC, int &code) {
     return false;
   }
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(kIsrgRootX1Pem);
   client.setTimeout(kWeatherFetchTimeoutMs);
   HTTPClient http;
   http.setTimeout(kWeatherFetchTimeoutMs);
@@ -19120,7 +19178,7 @@ bool beginTileDownload() {
   tileDownloadPath = tileDownloadFinalPath + ".tmp";
 
   if (url.startsWith("https://")) {
-    tileDownloadSecureClient.setInsecure();
+    tileDownloadSecureClient.setCACert(kIsrgRootX1Pem);
     tileDownloadSecureClient.setTimeout(kTileDownloadTimeoutMs);
     tileDownloadSecureClient.setHandshakeTimeout(5);
     tileDownloadHttp.begin(tileDownloadSecureClient, url);
@@ -20911,6 +20969,10 @@ static void drawMapZoomLoadingIndicator(uint8_t targetZoom) {
 }
 
 static void enterMapScreen(bool showLoading) {
+  if (screen == SCREEN_WAYPOINTS && appSelected != kAppMenuIndex &&
+      responderAppRegistry.activeLegacyIndex() == appSelected) {
+    responderAppRegistry.stopByLegacyIndex(appSelected);
+  }
   bool changingScreens = screen != SCREEN_MAIN;
   screen = SCREEN_MAIN;
   mapPanHeldKey = 0;
@@ -21798,9 +21860,10 @@ static bool fetchAircraftWifi() {
   uint16_t radiusNm = static_cast<uint16_t>(
       constrain(static_cast<int>(ceilf(aircraftRangeKm * 0.539957f)), 1, 250));
   radiusNm = min<uint16_t>(radiusNm, kAircraftWifiMaxRadiusNm);
-  String url = "http://api.adsb.lol/v2/lat/" + String(lat, 5) + "/lon/" +
+  String url = "https://api.adsb.lol/v2/lat/" + String(lat, 5) + "/lon/" +
                String(lon, 5) + "/dist/" + String(radiusNm);
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setCACert(kIsrgRootX1Pem);
   client.setTimeout(8000);
   HTTPClient http;
   http.setTimeout(8000);
@@ -31187,7 +31250,12 @@ void drawWifiScreen() {
   }
 
   if (redrawStatus) {
-    const char *enableLabel = wifiEnabled ? "DISABLE" : "ENABLE";
+    bool wifiEnableBusy = (wifiBootEnablePending && !wifiEnabled) ||
+                          (wifiEnabled && WiFi.status() != WL_CONNECTED &&
+                           (wifiTransition || wifiEnableReconnectSequence ||
+                            wifiAsyncReconnectActive));
+    const char *enableLabel = wifiEnableBusy ? "ENABLING" :
+                              (wifiEnabled ? "DISABLE" : "ENABLE");
     uint16_t enableBg = wifiEnabled ? colors.redDim : colors.black;
     uint16_t enableFg = colors.amber;
     if (!wifiAvailable) {
@@ -31206,7 +31274,7 @@ void drawWifiScreen() {
     M5.Display.drawString(enableLabel, wifiScanButton.x + wifiScanButton.w / 2,
                           wifiScanButton.y + wifiScanButton.h / 2);
 
-    bool canScan = wifiEnabled && wifiAvailable;
+    bool canScan = wifiEnabled && wifiAvailable && !wifiEnableBusy;
     const char *scanLabel = wifiScanInProgress ? "STOP SCAN" : "SCAN";
     uint16_t scanBg = colors.black;
     uint16_t scanFg = canScan ? colors.amber : colors.amberDim;
@@ -31251,6 +31319,9 @@ void drawWifiScreen() {
       status = "CONNECTED";
       statusColor = colors.amber;
       wifiConnected = true;
+    } else if (wifiEnableBusy) {
+      status = "ENABLING WIFI";
+      statusColor = colors.amber;
     } else if (wifiEnabled) {
       status = "DISCONNECTED";
       statusColor = colors.red;
@@ -32557,6 +32628,10 @@ void handleTouch() {
             (appSelected == kAppCameraIndex || appSelected == kAppGalleryIndex)) {
           restoreWifiAfterCameraApp();
         }
+        if (screen == SCREEN_WAYPOINTS && appSelected != kAppMenuIndex &&
+            responderAppRegistry.activeLegacyIndex() == appSelected) {
+          responderAppRegistry.stopByLegacyIndex(appSelected);
+        }
         if (i == 0) {
           mapViewMode = MapViewMode::NAV;
           enterMapScreen();
@@ -33028,7 +33103,14 @@ void handleTouch() {
       if (!wifiAvailable) {
         return;
       }
-      setWifiEnabled(!wifiEnabled);
+      if (wifiEnabled) {
+        setWifiEnabled(false);
+      } else if (!wifiBootEnablePending) {
+        wifiBootEnablePending = true;
+        wifiBootEnableAfterMs = millis() + 250;
+        wifiStatusDirty = true;
+        wifiListDirty = true;
+      }
       wifiDirty = true;
       wifiNeedsFullRedraw = true;
       return;
@@ -33962,6 +34044,10 @@ bool serialDebugLeaveCurrentApp(uint8_t nextApp) {
     }
   }
 #endif
+  if (screen == SCREEN_WAYPOINTS && appSelected != nextApp &&
+      responderAppRegistry.activeLegacyIndex() == appSelected) {
+    responderAppRegistry.stopByLegacyIndex(appSelected);
+  }
   return false;
 }
 
@@ -34505,6 +34591,18 @@ void handleSerialDebugCommand(String line) {
       startWifiScan();
       debugPrint("DEV: wifi scan requested enabled=%u available=%u", wifiEnabled ? 1 : 0,
                  wifiAvailable ? 1 : 0);
+      } else if (arg == "off" || arg == "disable") {
+        setWifiEnabled(false);
+        debugPrint("DEV: wifi disable requested");
+      } else if (arg == "on" || arg == "enable") {
+        if (!wifiEnabled && !wifiBootEnablePending) {
+          wifiBootEnablePending = true;
+          wifiBootEnableAfterMs = millis() + 250;
+          wifiStatusDirty = true;
+          wifiListDirty = true;
+          wifiDirty = true;
+        }
+        debugPrint("DEV: wifi async enable requested");
       } else if (arg == "profile" || arg == "reboot") {
         debugPrint("DEV: wifi profile reboot requested");
         requestWifiBoot();
@@ -34543,7 +34641,7 @@ void handleSerialDebugCommand(String line) {
                  wifiScanInProgress ? 1 : 0, wifiNetworkCount,
                  WiFi.status() == WL_CONNECTED ? 1U : 0U);
     } else {
-        debugPrint("DEV: wifi commands: connect <ssid> <password> | scan | profile | status | update | update-local");
+        debugPrint("DEV: wifi commands: connect <ssid> <password> | scan | on | off | profile | status | update | update-local");
     }
 #else
     debugPrint("DEV: wifi disabled in build");
@@ -35843,8 +35941,51 @@ void loop() {
         ntpConfigured = false;
       }
     }
+    if (wifiAsyncReconnectActive) {
+      if (currentStatus == WL_CONNECTED) {
+        wifiAsyncReconnectIndex = wifiAsyncReconnectCurrentIndex;
+        wifiAsyncReconnectActive = false;
+        wifiAsyncReconnectStartedMs = 0;
+        wifiEnableReconnectSequence = false;
+        wifiAsyncReconnectCycleAttempts = 0;
+        wifiStatusDirty = true;
+        debugPrint("WIFI: async reconnect complete");
+      } else if (now - wifiAsyncReconnectStartedMs >= kWifiAsyncConnectTimeoutMs) {
+        debugPrint("WIFI: async reconnect attempt timeout status=%d attempt=%u/%u",
+                   static_cast<int>(currentStatus),
+                   static_cast<unsigned>(wifiAsyncReconnectCycleAttempts),
+                   static_cast<unsigned>(savedCredCount));
+        WiFi.disconnect(false, false);
+        wifiAsyncReconnectActive = false;
+        wifiAsyncReconnectStartedMs = 0;
+        wifiStatusDirty = true;
+        if (!wifiEnableReconnectSequence ||
+            wifiAsyncReconnectCycleAttempts >= savedCredCount) {
+          wifiEnableReconnectSequence = false;
+          wifiAsyncReconnectCycleAttempts = 0;
+          wifiLastAutoConnectAttemptMs = now;
+          debugPrint("WIFI: async reconnect cycle finished disconnected");
+        }
+      }
+    }
+    if (wifiEnableReconnectSequence && wifiEnabled && wifiAvailable &&
+        currentStatus != WL_CONNECTED && !wifiScanInProgress && !wifiTransition &&
+        !wifiAsyncReconnectActive) {
+      if (wifiAsyncReconnectCycleAttempts < savedCredCount) {
+        if (!beginAsyncWifiReconnect()) {
+          wifiEnableReconnectSequence = false;
+          wifiAsyncReconnectCycleAttempts = 0;
+          wifiStatusDirty = true;
+        }
+      } else {
+        wifiEnableReconnectSequence = false;
+        wifiAsyncReconnectCycleAttempts = 0;
+        wifiStatusDirty = true;
+      }
+    }
     if (wifiEnabled && wifiAvailable && savedCredCount > 0 && currentStatus != WL_CONNECTED &&
-        !wifiScanInProgress && !wifiTransition &&
+        !wifiScanInProgress && !wifiTransition && !wifiAsyncReconnectActive &&
+        !wifiEnableReconnectSequence &&
         now - wifiLastAutoConnectAttemptMs >= 30000UL) {
       debugPrint("WIFI: background reconnect status=%d saved=%u moving=%u",
                  static_cast<int>(currentStatus), static_cast<unsigned>(savedCredCount),

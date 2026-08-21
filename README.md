@@ -6,6 +6,8 @@
 
 ## What changed in v0.73 Beta
 
+- Makes Wi-Fi scanning repeatable by following the hosted-radio scan completion event and cleaning up stale scan state.
+- Enables and reconnects Wi-Fi asynchronously so the controls remain responsive instead of pausing for every saved network.
 - Prevents the active RF/USB app from reclaiming USB while Wi-Fi is being restored.
 - Keeps the Wi-Fi restoration screen active until the device is actually reconnected.
 - Stops Deploy Cam cleanly before low-memory Wi-Fi recovery can invalidate its live socket.

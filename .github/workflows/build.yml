@@ -6,12 +6,15 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   tab5:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: Public-release privacy gate
@@ -20,7 +23,7 @@ jobs:
           set -euo pipefail
           if git grep -I -n -E \
             'C:[/\\]Users[/\\]|-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----|gh[opusr]_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,}' \
-            -- src include apps sdcard deploy_cam_esp32cam platformio.ini; then
+            -- .; then
             echo "Public tree contains a credential or personal-path marker."
             exit 1
           fi
@@ -31,7 +34,7 @@ jobs:
             exit 1
           fi
       - name: Install PlatformIO
-        run: pip install platformio
+        run: pip install platformio==6.1.19
       - name: Build Responder Nav
         run: pio run -e esp32p4_pioarduino55
       - name: Build Deploy Cam

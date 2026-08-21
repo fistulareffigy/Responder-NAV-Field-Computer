@@ -320,20 +320,22 @@ esp_err_t scsi_cmd_read10(msc_host_device_handle_t dev,
                           uint32_t num_sectors,
                           uint32_t sector_size)
 {
-    if (num_sectors != 0 && sector_size > UINT32_MAX / num_sectors) {
+    if (num_sectors > UINT16_MAX ||
+            (num_sectors != 0 && sector_size > UINT32_MAX / num_sectors)) {
         return ESP_ERR_INVALID_SIZE;
     }
+    const uint32_t transfer_size = num_sectors * sector_size;
 
     msc_device_t *device = (msc_device_t *)dev;
     cbw_read10_t cbw = {
-        CBW_BASE_INIT(IN_DIR, CBW_CMD_SIZE(cbw_read10_t), num_sectors * sector_size),
+        CBW_BASE_INIT(IN_DIR, CBW_CMD_SIZE(cbw_read10_t), transfer_size),
         .opcode = SCSI_CMD_READ10,
         .flags = 0, // lun
         .address = __builtin_bswap32(sector_address),
         .length = __builtin_bswap16(num_sectors),
     };
 
-    esp_err_t ret = bot_execute_command(device, &cbw.base, data, num_sectors * sector_size);
+    esp_err_t ret = bot_execute_command(device, &cbw.base, data, transfer_size);
 
     // In case of an error, get an error code
     if (unlikely(ret != ESP_OK)) {
@@ -348,19 +350,21 @@ esp_err_t scsi_cmd_write10(msc_host_device_handle_t dev,
                            uint32_t num_sectors,
                            uint32_t sector_size)
 {
-    if (num_sectors != 0 && sector_size > UINT32_MAX / num_sectors) {
+    if (num_sectors > UINT16_MAX ||
+            (num_sectors != 0 && sector_size > UINT32_MAX / num_sectors)) {
         return ESP_ERR_INVALID_SIZE;
     }
+    const uint32_t transfer_size = num_sectors * sector_size;
 
     msc_device_t *device = (msc_device_t *)dev;
     cbw_write10_t cbw = {
-        CBW_BASE_INIT(OUT_DIR, CBW_CMD_SIZE(cbw_write10_t), num_sectors * sector_size),
+        CBW_BASE_INIT(OUT_DIR, CBW_CMD_SIZE(cbw_write10_t), transfer_size),
         .opcode = SCSI_CMD_WRITE10,
         .address = __builtin_bswap32(sector_address),
         .length = __builtin_bswap16(num_sectors),
     };
 
-    esp_err_t ret = bot_execute_command(device, &cbw.base, (void *)data, num_sectors * sector_size);
+    esp_err_t ret = bot_execute_command(device, &cbw.base, (void *)data, transfer_size);
 
     // In case of an error, get an error code
     if (unlikely(ret != ESP_OK)) {
