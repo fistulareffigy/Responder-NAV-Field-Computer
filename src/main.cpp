@@ -76,6 +76,7 @@ static inline const char *vba_embed_core_name(void) { return "GBA REMOVED"; }
 #include <esp_sccb_i2c.h>
 #include <sc202cs.h>
 #include "lock_screen_art.h"
+#include "security_certs.h"
 #include "usb_host_manager.h"
 #ifdef FILE_READ
 #undef FILE_READ
@@ -5137,8 +5138,9 @@ void loadTileServer() {
       applyTileStyle(false);
     }
   }
-  debugPrint("TILES: server=%s style=%s key=%d", tileServerBase.c_str(), tileServerStyle.c_str(),
-             tileServerKey.length() > 0 ? 1 : 0);
+  debugPrint("TILES: configured=%u style=%s key=%u",
+             tileServerBase.length() > 0 ? 1U : 0U, tileServerStyle.c_str(),
+             tileServerKey.length() > 0 ? 1U : 0U);
   unlockSd();
 }
 
@@ -10434,7 +10436,7 @@ bool fetchWeather(double lat, double lon, float &tempC, int &code) {
     return false;
   }
   WiFiClientSecure client;
-  client.setInsecure();
+  client.setCACert(kIsrgRootX1Pem);
   client.setTimeout(kWeatherFetchTimeoutMs);
   HTTPClient http;
   http.setTimeout(kWeatherFetchTimeoutMs);
@@ -19176,7 +19178,7 @@ bool beginTileDownload() {
   tileDownloadPath = tileDownloadFinalPath + ".tmp";
 
   if (url.startsWith("https://")) {
-    tileDownloadSecureClient.setInsecure();
+    tileDownloadSecureClient.setCACert(kIsrgRootX1Pem);
     tileDownloadSecureClient.setTimeout(kTileDownloadTimeoutMs);
     tileDownloadSecureClient.setHandshakeTimeout(5);
     tileDownloadHttp.begin(tileDownloadSecureClient, url);
@@ -20967,6 +20969,10 @@ static void drawMapZoomLoadingIndicator(uint8_t targetZoom) {
 }
 
 static void enterMapScreen(bool showLoading) {
+  if (screen == SCREEN_WAYPOINTS && appSelected != kAppMenuIndex &&
+      responderAppRegistry.activeLegacyIndex() == appSelected) {
+    responderAppRegistry.stopByLegacyIndex(appSelected);
+  }
   bool changingScreens = screen != SCREEN_MAIN;
   screen = SCREEN_MAIN;
   mapPanHeldKey = 0;
@@ -21854,9 +21860,10 @@ static bool fetchAircraftWifi() {
   uint16_t radiusNm = static_cast<uint16_t>(
       constrain(static_cast<int>(ceilf(aircraftRangeKm * 0.539957f)), 1, 250));
   radiusNm = min<uint16_t>(radiusNm, kAircraftWifiMaxRadiusNm);
-  String url = "http://api.adsb.lol/v2/lat/" + String(lat, 5) + "/lon/" +
+  String url = "https://api.adsb.lol/v2/lat/" + String(lat, 5) + "/lon/" +
                String(lon, 5) + "/dist/" + String(radiusNm);
-  WiFiClient client;
+  WiFiClientSecure client;
+  client.setCACert(kIsrgRootX1Pem);
   client.setTimeout(8000);
   HTTPClient http;
   http.setTimeout(8000);
@@ -32621,6 +32628,10 @@ void handleTouch() {
             (appSelected == kAppCameraIndex || appSelected == kAppGalleryIndex)) {
           restoreWifiAfterCameraApp();
         }
+        if (screen == SCREEN_WAYPOINTS && appSelected != kAppMenuIndex &&
+            responderAppRegistry.activeLegacyIndex() == appSelected) {
+          responderAppRegistry.stopByLegacyIndex(appSelected);
+        }
         if (i == 0) {
           mapViewMode = MapViewMode::NAV;
           enterMapScreen();
@@ -34033,6 +34044,10 @@ bool serialDebugLeaveCurrentApp(uint8_t nextApp) {
     }
   }
 #endif
+  if (screen == SCREEN_WAYPOINTS && appSelected != nextApp &&
+      responderAppRegistry.activeLegacyIndex() == appSelected) {
+    responderAppRegistry.stopByLegacyIndex(appSelected);
+  }
   return false;
 }
 

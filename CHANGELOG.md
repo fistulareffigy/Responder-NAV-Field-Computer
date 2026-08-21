@@ -7,6 +7,13 @@
 - Made the last successful saved network the preferred target after Wi-Fi is disabled and re-enabled.
 - Added an immediate `ENABLING WIFI` state so the Wi-Fi Control screen remains responsive during radio startup.
 - Re-ran the public privacy gate, CodeQL analysis, credential/path checks, and release-binary marker scan; no private credentials or development-only identifiers were detected.
+- Hardened File Transfer with one-time 128-bit bootstrap authentication, a separate exact-match session cookie, Host validation, POST-only deletion, and restrictive browser security headers.
+- Removed disabled TLS verification from weather and default map downloads, and moved the Wi-Fi aircraft feed to certificate-validated HTTPS.
+- Documented the reversible software-only security model, including the explicit decision not to burn security eFuses and the remaining physical-access and Deploy Cam limitations.
+- Restricted GitHub Actions to read-only repository contents and hardened vendored USB MSC READ/WRITE(10) length validation to clear the open CodeQL findings.
+- Bounded File Transfer request lines, header count, header bytes, and header parsing time; invalid or incomplete requests now fail closed.
+- Closed registered app services during direct navigation so File Transfer no longer leaves TCP port 8080 listening after exit.
+- Redacted custom map-server URLs from serial output and pinned GitHub Actions, PlatformIO, and the optional design tool to reviewed versions.
 
 ## Responder Nav v0.73 Beta - 2026-07-30
 

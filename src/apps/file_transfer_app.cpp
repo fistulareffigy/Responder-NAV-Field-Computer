@@ -34,6 +34,9 @@ namespace {
 
 constexpr uint16_t kFileTransferPort = 8080;
 constexpr size_t kHttpLineMax = 192;
+constexpr size_t kHttpHeaderMaxBytes = 4096;
+constexpr uint8_t kHttpHeaderMaxCount = 32;
+constexpr uint32_t kHttpHeaderDeadlineMs = 2000;
 struct UiRect {
   int16_t x;
   int16_t y;
@@ -66,16 +69,80 @@ String urlDecode(const String &in) {
   return out;
 }
 
+String randomToken128() {
+  char token[33] = {};
+  snprintf(token, sizeof(token), "%08lx%08lx%08lx%08lx",
+           static_cast<unsigned long>(esp_random()),
+           static_cast<unsigned long>(esp_random()),
+           static_cast<unsigned long>(esp_random()),
+           static_cast<unsigned long>(esp_random()));
+  return String(token);
+}
+
+bool constantTimeEquals(const String &left, const String &right) {
+  if (left.length() != right.length() || left.length() == 0) return false;
+  uint8_t difference = 0;
+  for (size_t i = 0; i < left.length(); ++i) {
+    difference |= static_cast<uint8_t>(left[i] ^ right[i]);
+  }
+  return difference == 0;
+}
+
+bool parseContentLength(const String &value, int &parsed) {
+  String text = value;
+  text.trim();
+  if (text.length() == 0) return false;
+  uint32_t result = 0;
+  for (size_t i = 0; i < text.length(); ++i) {
+    char c = text[i];
+    if (c < '0' || c > '9') return false;
+    uint8_t digit = static_cast<uint8_t>(c - '0');
+    if (result > (0x7FFFFFFFUL - digit) / 10UL) return false;
+    result = result * 10UL + digit;
+  }
+  parsed = static_cast<int>(result);
+  return true;
+}
+
 String queryValue(const String &target, const char *key) {
-  String needle = String(key) + "=";
   int q = target.indexOf('?');
   if (q < 0) return "";
-  int pos = target.indexOf(needle, q + 1);
-  if (pos < 0) return "";
-  pos += needle.length();
-  int end = target.indexOf('&', pos);
-  if (end < 0) end = target.length();
-  return urlDecode(target.substring(pos, end));
+  int pos = q + 1;
+  while (pos < static_cast<int>(target.length())) {
+    int end = target.indexOf('&', pos);
+    if (end < 0) end = target.length();
+    int equals = target.indexOf('=', pos);
+    if (equals >= pos && equals < end && target.substring(pos, equals) == key) {
+      return urlDecode(target.substring(equals + 1, end));
+    }
+    pos = end + 1;
+  }
+  return "";
+}
+
+String cookieValue(const String &header, const char *key) {
+  int colon = header.indexOf(':');
+  if (colon < 0) return "";
+  String cookies = header.substring(colon + 1);
+  int pos = 0;
+  while (pos < static_cast<int>(cookies.length())) {
+    while (pos < static_cast<int>(cookies.length()) &&
+           (cookies[pos] == ' ' || cookies[pos] == ';')) ++pos;
+    int end = cookies.indexOf(';', pos);
+    if (end < 0) end = cookies.length();
+    int equals = cookies.indexOf('=', pos);
+    if (equals >= pos && equals < end) {
+      String name = cookies.substring(pos, equals);
+      name.trim();
+      if (name == key) {
+        String value = cookies.substring(equals + 1, end);
+        value.trim();
+        return value;
+      }
+    }
+    pos = end + 1;
+  }
+  return "";
 }
 
 bool sanitizePath(String &path, bool allowRoot = false) {
@@ -162,11 +229,8 @@ public:
     _lastRenderedUrl = "";
     _lastRenderedRequest = "";
 #if ENABLE_WIFI
-    char token[17] = {};
-    snprintf(token, sizeof(token), "%08lx%08lx",
-             static_cast<unsigned long>(esp_random()),
-             static_cast<unsigned long>(esp_random()));
-    _accessToken = token;
+    _bootstrapToken = randomToken128();
+    _sessionToken = "";
     _wifiBootRequested = false;
     if (WiFi.status() != WL_CONNECTED) {
       _status = "REBOOTING FOR WI-FI";
@@ -184,6 +248,8 @@ public:
     _server.stop();
 #endif
     _serverStarted = false;
+    _bootstrapToken = "";
+    _sessionToken = "";
     _status = "STOPPED";
     _needsFullRedraw = true;
   }
@@ -204,9 +270,10 @@ public:
 #if ENABLE_WIFI
     bool connected = WiFi.status() == WL_CONNECTED;
     String wifiLine = String("Wi-Fi: ") + (connected ? WiFi.SSID() : "NOT CONNECTED");
-    String url = connected ? String("http://") + WiFi.localIP().toString() + ":" +
-                                 String(kFileTransferPort) + "/?token=" + _accessToken
-                           : "Connect Wi-Fi first";
+    String url = !connected ? "Connect Wi-Fi first" :
+                 (_bootstrapToken.length() ? String("http://") + WiFi.localIP().toString() + ":" +
+                                                String(kFileTransferPort) + "/?token=" + _bootstrapToken
+                                          : "AUTHORIZED SESSION ACTIVE - REOPEN APP TO PAIR AGAIN");
 #else
     bool connected = false;
     String wifiLine = "Wi-Fi build disabled";
@@ -317,13 +384,13 @@ private:
       _serverStarted = static_cast<bool>(_server);
       _status = _serverStarted ? "READY" : "SERVER START FAIL";
       _url = String("http://") + WiFi.localIP().toString() + ":" +
-             String(kFileTransferPort) + "/?token=" + _accessToken;
+             String(kFileTransferPort) + "/?token=" + _bootstrapToken;
       debugPrint("FILEXFER: server %s port=%u protected=1",
                  _serverStarted ? "ready" : "start failed",
                  static_cast<unsigned>(kFileTransferPort));
     } else {
       String currentUrl = String("http://") + WiFi.localIP().toString() + ":" +
-                          String(kFileTransferPort) + "/?token=" + _accessToken;
+                          String(kFileTransferPort) + "/?token=" + _bootstrapToken;
       if (currentUrl != _url) {
         _url = currentUrl;
         debugPrint("FILEXFER: local address changed; protected URL refreshed");
@@ -334,7 +401,9 @@ private:
 #endif
   }
 
-  bool readLine(WiFiClient &client, char *buffer, size_t bufferSize, uint32_t timeoutMs) {
+  bool readLine(WiFiClient &client, char *buffer, size_t bufferSize, uint32_t timeoutMs,
+                bool *overflow = nullptr) {
+    if (overflow) *overflow = false;
     size_t used = 0;
     uint32_t start = millis();
     while (millis() - start < timeoutMs && client.connected()) {
@@ -345,7 +414,11 @@ private:
           buffer[min(used, bufferSize - 1)] = 0;
           return true;
         }
-        if (used + 1 < bufferSize) buffer[used++] = c;
+        if (used + 1 < bufferSize) {
+          buffer[used++] = c;
+        } else if (overflow) {
+          *overflow = true;
+        }
       }
       delay(1);
     }
@@ -362,8 +435,14 @@ private:
     client.setTimeout(1000);
     debugPrint("FILEXFER: client connected");
     char line[kHttpLineMax] = {};
-    if (!readLine(client, line, sizeof(line), 1200)) {
+    bool lineOverflow = false;
+    if (!readLine(client, line, sizeof(line), 1200, &lineOverflow)) {
       debugPrint("FILEXFER: client no request line");
+      client.stop();
+      return;
+    }
+    if (lineOverflow) {
+      sendPlain(client, 414, "URI Too Long", "Request line too long\n");
       client.stop();
       return;
     }
@@ -381,21 +460,69 @@ private:
     String requestPath = queryStart >= 0 ? target.substring(0, queryStart) : target;
     debugPrint("FILEXFER: request method=%s path=%s", method.c_str(), requestPath.c_str());
     int contentLength = 0;
-    bool cookieAuthorized = false;
-    while (readLine(client, line, sizeof(line), 1200)) {
-      if (line[0] == 0) break;
+    String requestHost;
+    String requestCookie;
+    size_t headerBytes = 0;
+    uint8_t headerCount = 0;
+    bool headersComplete = false;
+    bool headersRejected = false;
+    uint32_t headerDeadline = millis() + kHttpHeaderDeadlineMs;
+    while (static_cast<int32_t>(headerDeadline - millis()) > 0) {
+      uint32_t remainingMs = headerDeadline - millis();
+      lineOverflow = false;
+      if (!readLine(client, line, sizeof(line), remainingMs, &lineOverflow)) break;
+      if (lineOverflow) {
+        sendPlain(client, 431, "Request Header Fields Too Large", "Header line too long\n");
+        headersRejected = true;
+        break;
+      }
+      if (line[0] == 0) {
+        headersComplete = true;
+        break;
+      }
+      headerBytes += strlen(line) + 2;
+      headerCount++;
+      if (headerBytes > kHttpHeaderMaxBytes || headerCount > kHttpHeaderMaxCount) {
+        sendPlain(client, 431, "Request Header Fields Too Large", "Too many headers\n");
+        headersRejected = true;
+        break;
+      }
       String header(line);
       if (header.startsWith("Cookie:") || header.startsWith("cookie:")) {
-        cookieAuthorized = header.indexOf(String("RNFT=") + _accessToken) >= 0;
+        requestCookie = cookieValue(header, "RNFT");
+      }
+      if (header.startsWith("Host:") || header.startsWith("host:")) {
+        int colon = header.indexOf(':');
+        requestHost = colon >= 0 ? header.substring(colon + 1) : "";
+        requestHost.trim();
       }
       header.toLowerCase();
       if (header.startsWith("content-length:")) {
-        contentLength = header.substring(15).toInt();
+        if (!parseContentLength(header.substring(15), contentLength)) {
+          sendPlain(client, 400, "Bad Request", "Invalid content length\n");
+          headersRejected = true;
+          break;
+        }
       }
     }
-    bool queryAuthorized = queryValue(target, "token") == _accessToken;
+    if (headersRejected) {
+      client.stop();
+      return;
+    }
+    if (!headersComplete) {
+      sendPlain(client, 408, "Request Timeout", "Incomplete request headers\n");
+      client.stop();
+      return;
+    }
+    String expectedHost = WiFi.localIP().toString();
+    bool hostAuthorized = requestHost == expectedHost ||
+                          requestHost == expectedHost + ":" + String(kFileTransferPort);
+    bool cookieAuthorized = constantTimeEquals(requestCookie, _sessionToken);
+    bool queryAuthorized = constantTimeEquals(queryValue(target, "token"), _bootstrapToken);
     bool authorized = cookieAuthorized || queryAuthorized;
-    if (method == "GET" && target == "/ping") {
+    if (!hostAuthorized) {
+      sendPlain(client, 421, "Misdirected Request", "Invalid host\n");
+    } else if (method == "GET" && target == "/ping") {
       sendPlain(client, 200, "OK", "OK\n");
     } else if (!authorized) {
       sendPlain(client, 401, "Unauthorized",
@@ -404,7 +531,7 @@ private:
       handleIndex(client, target, queryAuthorized);
     } else if (method == "GET" && target.startsWith("/download")) {
       handleDownload(client, target);
-    } else if (method == "GET" && target.startsWith("/delete")) {
+    } else if (method == "POST" && target.startsWith("/delete")) {
       handleDelete(client, target);
     } else if (method == "POST" && target.startsWith("/mkdir")) {
       handleMkdir(client, target);
@@ -418,6 +545,9 @@ private:
   }
 
   void handleIndex(WiFiClient &client, const String &target, bool setAccessCookie) {
+    if (setAccessCookie) {
+      _sessionToken = randomToken128();
+    }
     String dir = queryValue(target, "dir");
     if (!sanitizePath(dir, true)) dir = "/";
     String html;
@@ -438,7 +568,7 @@ private:
     html += "'";
     html += urlEncode(dir);
     html += "'";
-    html += F(";function up(){let f=document.getElementById('f').files[0],s=document.getElementById('s'),b=document.getElementById('b');if(!f){s.textContent='SELECT A FILE';return}let x=new XMLHttpRequest;x.open('POST','/upload?dir='+DIR+'&name='+encodeURIComponent(f.name));x.upload.onprogress=e=>{if(e.lengthComputable){let p=Math.round(e.loaded*100/e.total);b.style.width=p+'%';s.textContent='UPLOADING '+f.name+'  '+p+'%'}};x.onload=()=>{s.textContent=x.responseText||('HTTP '+x.status);if(x.status>=200&&x.status<300)setTimeout(()=>location.href='/?dir='+DIR,650)};x.onerror=()=>s.textContent='UPLOAD CONNECTION FAILED';x.send(f)}async function mk(){let n=document.getElementById('dn').value.trim(),s=document.getElementById('ms');if(!n){s.textContent='ENTER A FOLDER NAME';return}let r=await fetch('/mkdir?dir='+DIR+'&name='+encodeURIComponent(n),{method:'POST'});s.textContent=await r.text();if(r.ok)setTimeout(()=>location.href='/?dir='+DIR,500)}</script>");
+    html += F(";function up(){let f=document.getElementById('f').files[0],s=document.getElementById('s'),b=document.getElementById('b');if(!f){s.textContent='SELECT A FILE';return}let x=new XMLHttpRequest;x.open('POST','/upload?dir='+DIR+'&name='+encodeURIComponent(f.name));x.upload.onprogress=e=>{if(e.lengthComputable){let p=Math.round(e.loaded*100/e.total);b.style.width=p+'%';s.textContent='UPLOADING '+f.name+'  '+p+'%'}};x.onload=()=>{s.textContent=x.responseText||('HTTP '+x.status);if(x.status>=200&&x.status<300)setTimeout(()=>location.href='/?dir='+DIR,650)};x.onerror=()=>s.textContent='UPLOAD CONNECTION FAILED';x.send(f)}async function mk(){let n=document.getElementById('dn').value.trim(),s=document.getElementById('ms');if(!n){s.textContent='ENTER A FOLDER NAME';return}let r=await fetch('/mkdir?dir='+DIR+'&name='+encodeURIComponent(n),{method:'POST'});s.textContent=await r.text();if(r.ok)setTimeout(()=>location.href='/?dir='+DIR,500)}async function rm(p){if(!confirm('Delete file?'))return false;let r=await fetch('/delete?path='+p+'&dir='+DIR,{method:'POST'});if(r.ok)location.href='/?dir='+DIR;else alert(await r.text());return false}</script>");
     html += F("<main class=grid><section class=panel><h2>FOLDERS</h2><ul>");
     if (!sdReady || !lockSd(300)) {
       html += F("<li>SD not ready or busy</li>");
@@ -476,11 +606,9 @@ private:
             html += String(static_cast<unsigned>(f.fileSize() / 1024));
             html += F(" KB</span> <a href='/download?path=");
             html += urlEncode(path);
-            html += F("'>DOWNLOAD</a><a class=danger href='/delete?path=");
+            html += F("'>DOWNLOAD</a><button class=danger onclick='return rm(\"");
             html += urlEncode(path);
-            html += F("&dir=");
-            html += urlEncode(dir);
-            html += F("' onclick='return confirm(\"Delete file?\")'>DELETE</a></li>");
+            html += F("\")'>DELETE</button></li>");
           }
           f.close();
         }
@@ -489,14 +617,20 @@ private:
       unlockSd();
     }
     html += F("</ul></section></main><footer>RESPONDER NAV // LOCAL NETWORK ONLY // PORT 8080</footer></div></body></html>");
-    client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nCache-Control: no-store\r\n");
+    client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nContent-Security-Policy: default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'\r\n");
     if (setAccessCookie) {
       client.print("Set-Cookie: RNFT=");
-      client.print(_accessToken);
+      client.print(_sessionToken);
       client.print("; Path=/; HttpOnly; SameSite=Strict\r\n");
     }
     client.printf("Content-Length: %u\r\n\r\n", static_cast<unsigned>(html.length()));
     client.print(html);
+    if (setAccessCookie) {
+      _bootstrapToken = "";
+      _url = "";
+      _status = "SESSION ACTIVE";
+      _needsFullRedraw = true;
+    }
     _lastRequest = "INDEX";
   }
 
@@ -643,7 +777,8 @@ private:
   String _status = "STOPPED";
   String _lastRequest = "NONE";
   String _url;
-  String _accessToken;
+  String _bootstrapToken;
+  String _sessionToken;
   String _lastRenderedStatus;
   String _lastRenderedWifi;
   String _lastRenderedUrl;
