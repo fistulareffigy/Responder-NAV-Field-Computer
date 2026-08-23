@@ -1,5 +1,14 @@
 # Changelog
 
+## Responder Nav v0.73 Beta UI maintenance update - 2026-08-23
+
+- Reworked the MeshCore footer as a single coherent region so navigation hints and action buttons no longer overlap or leave stale pixels behind.
+- Increased MeshCore row-label and action-button legibility while keeping long values clipped inside their assigned columns.
+- Replaced the oversized identity export payload with a compact profile-ready status and shortened device-ID preview.
+- Placed RF Scan RTL status and tuned-frequency summaries side by side to recover vertical space for larger tuning, volume, audio-settings, and mode controls.
+- Added bounded RF status text and concise frequency-entry, step, level, TPMS, and key-fob monitoring details.
+- Built, flashed, and exercised the MeshCore menu, identity, messages, keyboard selection, RF Scan entry, Wi-Fi restoration, and memory/heartbeat paths on Tab5 hardware.
+
 ## Responder Nav v0.73 Beta maintenance update - 2026-08-20
 
 - Fixed intermittent Wi-Fi scans by waiting for the ESP-Hosted scan-complete event and clearing stale driver scan state between attempts.
