@@ -10604,7 +10604,8 @@ void drawWaypointNameModal() {
   M5.Display.setTextDatum(TL_DATUM);
 }
 
-static void drawTerminalButton(const Rect &rect, const char *label, uint16_t color) {
+static void drawTerminalButton(const Rect &rect, const char *label, uint16_t color,
+                               uint8_t textSize = kButtonTextSize) {
   M5.Display.fillRect(rect.x, rect.y, rect.w, rect.h, colors.black);
   M5.Display.drawRect(rect.x, rect.y, rect.w, rect.h, color);
   if (rect.w > 8 && rect.h > 8) {
@@ -10613,7 +10614,7 @@ static void drawTerminalButton(const Rect &rect, const char *label, uint16_t col
                         colors.amberDim);
   }
   M5.Display.setTextDatum(MC_DATUM);
-  M5.Display.setTextSize(kButtonTextSize);
+  M5.Display.setTextSize(textSize);
   M5.Display.setTextColor(color, colors.black);
   M5.Display.drawString(label, rect.x + rect.w / 2, rect.y + rect.h / 2);
 }
@@ -23750,59 +23751,98 @@ void drawSdrAppScreen(uint8_t appIndex, const char *title) {
   } else if (appIndex == kAppRfScanIndex || appIndex == kAppDroneIndex) {
     bool droneMode = appIndex == kAppDroneIndex;
     const RfBandProfile &band = currentRfBand();
-    Rect radioPanel = {12, contentTop, static_cast<int16_t>(screenW - 24),
-                       static_cast<int16_t>(lineH * 3 + 16)};
+    bool burstMonitor = band.function == RF_FUNC_TPMS || band.function == RF_FUNC_KEYFOB;
+    const int16_t panelGap = 8;
+    const int16_t panelW = static_cast<int16_t>((screenW - 24 - panelGap) / 2);
+    const int16_t summaryH = static_cast<int16_t>(lineH * 3 + 18);
+    Rect radioPanel = {12, contentTop, panelW, summaryH};
+    Rect frequencyPanel = {static_cast<int16_t>(radioPanel.x + radioPanel.w + panelGap),
+                           contentTop,
+                           static_cast<int16_t>(screenW - 12 -
+                                                (radioPanel.x + radioPanel.w + panelGap)),
+                           summaryH};
     drawTerminalPanel(radioPanel, rtlSdrStreaming ? colors.amber : colors.amberDim);
-    lineY = static_cast<int16_t>(radioPanel.y + 8);
-    drawLine(String("RTL: ") + String(rtlSdrStatusText()));
-    drawLine(droneMode ? String("MODE: RF ENERGY / ") + band.bandName + " / RTL IQ"
-                       : String("MODE: ") + band.functionName + " / " + band.bandName + " / " +
-                             band.demodName);
-    drawLine(String("STATUS: ") +
-             (rfScanRunning ? (rfCurrentModeScans() ? "SCANNING" : "LISTENING") : "IDLE"));
-
-    Rect frequencyPanel = {12, static_cast<int16_t>(radioPanel.y + radioPanel.h + 8),
-                           static_cast<int16_t>(screenW - 24),
-                           static_cast<int16_t>(lineH * 3 + 16)};
     drawTerminalPanel(frequencyPanel, rfFrequencyEntryActive ? colors.red : colors.amber);
-    lineY = static_cast<int16_t>(frequencyPanel.y + 7);
-    M5.Display.setTextDatum(TL_DATUM);
+
+    auto fitPanelText = [&](String text, int16_t width) -> String {
+      if (M5.Display.textWidth(text) <= width) return text;
+      const String ellipsis = "...";
+      while (text.length() > 0 &&
+             M5.Display.textWidth(text + ellipsis) > width) {
+        text.remove(text.length() - 1);
+      }
+      return text + ellipsis;
+    };
+    auto drawPanelText = [&](const Rect &panel, String text, int16_t y, uint8_t size,
+                             uint16_t color, uint8_t datum) {
+      M5.Display.setTextSize(size);
+      M5.Display.setTextDatum(datum);
+      M5.Display.setTextColor(color, colors.black);
+      const int16_t inset = 10;
+      text = fitPanelText(text, static_cast<int16_t>(panel.w - inset * 2));
+      int16_t x = panel.x + inset;
+      if (datum == MC_DATUM) x = static_cast<int16_t>(panel.x + panel.w / 2);
+      else if (datum == TR_DATUM || datum == MR_DATUM) {
+        x = static_cast<int16_t>(panel.x + panel.w - inset);
+      }
+      M5.Display.drawString(text, x, y);
+    };
+
+    const char *activity = rfScanRunning
+                               ? (burstMonitor ? "MONITORING"
+                                               : (rfCurrentModeScans() ? "SCANNING" : "LISTENING"))
+                               : "IDLE";
+    String modeSummary = droneMode
+                             ? String("RF ENERGY / ") + band.bandName + " / " + activity
+                             : String(band.functionName) + " / " + band.bandName + " / " +
+                                   band.demodName + " / " + activity;
+    drawPanelText(radioPanel, "RTL STATUS", radioPanel.y + 8, kSmallTextSize,
+                  colors.amberDim, TL_DATUM);
+    drawPanelText(radioPanel, rtlSdrStatusText(), radioPanel.y + lineH + 4,
+                  kButtonTextSize + 1,
+                  rtlSdrStreaming ? colors.amber : colors.amberDim, TL_DATUM);
+    drawPanelText(radioPanel, modeSummary, radioPanel.y + lineH * 2 + 8,
+                  kSmallTextSize, colors.amberDim, TL_DATUM);
+
+    drawPanelText(frequencyPanel, "TUNED FREQUENCY", frequencyPanel.y + 8,
+                  kSmallTextSize, colors.amberDim, TL_DATUM);
+    String tunedText = rfFrequencyEntryActive ? rfFrequencyInput + "_ MHz"
+                                              : formatRfFrequency(rfScanFreqHz);
+    drawPanelText(frequencyPanel, tunedText, frequencyPanel.y + lineH + 4,
+                  kButtonTextSize + 1,
+                  rfFrequencyEntryActive ? colors.red : colors.amber, TR_DATUM);
+    String frequencyDetail;
+    if (rfFrequencyEntryActive) {
+      frequencyDetail = "ENTER TO TUNE // ESC CANCEL";
+    } else if (burstMonitor) {
+      frequencyDetail = String("STEP ") + formatRfStep(rfScanStepHz) + " // LEVEL " +
+                        String(rfScanLevel) + " dBm";
+    } else {
+      frequencyDetail = String("STEP ") + formatRfStep(rfScanStepHz) + " // LEVEL " +
+                        String(rfScanLevel) + " dBm";
+    }
+    drawPanelText(frequencyPanel, frequencyDetail, frequencyPanel.y + lineH * 2 + 8,
+                  kSmallTextSize,
+                  rfFrequencyEntryActive ? colors.red : colors.amberDim, TR_DATUM);
+
     M5.Display.setTextSize(kSmallTextSize);
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("TUNED FREQUENCY", frequencyPanel.x + 10, lineY);
-    M5.Display.setTextDatum(TR_DATUM);
-    M5.Display.setTextSize(kButtonTextSize + 1);
-    M5.Display.setTextColor(rfFrequencyEntryActive ? colors.red : colors.amber, colors.black);
-    M5.Display.drawString(
-        rfFrequencyEntryActive ? rfFrequencyInput + "_ MHz" : formatRfFrequency(rfScanFreqHz),
-        frequencyPanel.x + frequencyPanel.w - 10, lineY);
     M5.Display.setTextDatum(TL_DATUM);
-    M5.Display.setTextSize(kSmallTextSize);
-    lineY = static_cast<int16_t>(lineY + lineH + 4);
-    drawLine(droneMode ? "INDICATOR: RF ACTIVITY ONLY - NOT REMOTE ID"
-                       : (rfFrequencyEntryActive
-                              ? String("KEYBOARD MHz: ") + rfFrequencyInput + "_  ENTER TO TUNE"
-                              : String("TYPE MHz WITH NUMBER KEYS  //  STEP ") +
-                                    formatRfStep(rfScanStepHz)),
-             rfFrequencyEntryActive ? colors.red : colors.amberDim);
-    drawLine(String("LEVEL ") + String(rfScanLevel) + " dBm  //  RANGE " +
-                 formatRfFrequency(band.minHz) + " - " + formatRfFrequency(band.maxHz),
-             colors.amberDim);
-    int16_t tuneY = static_cast<int16_t>(lineY + 4);
-    int16_t tuneH = 52;
+    lineY = static_cast<int16_t>(radioPanel.y + radioPanel.h);
+    int16_t tuneY = static_cast<int16_t>(lineY + 10);
+    int16_t tuneH = 60;
     int16_t tuneGap = 8;
     int16_t tuneW = static_cast<int16_t>((screenW - 24 - tuneGap * 2) / 3);
     rfFreqDownButton = {12, tuneY, tuneW, tuneH};
     rfStepButton = {static_cast<int16_t>(rfFreqDownButton.x + tuneW + tuneGap), tuneY, tuneW, tuneH};
     rfFreqUpButton = {static_cast<int16_t>(rfStepButton.x + tuneW + tuneGap), tuneY, tuneW, tuneH};
     String stepLabel = String("STEP ") + formatRfStep(rfScanStepHz);
-    drawBtn(rfFreqDownButton, "-", colors.amberDim);
-    drawBtn(rfStepButton, stepLabel.c_str(), colors.amberDim);
-    drawBtn(rfFreqUpButton, "+", colors.amberDim);
+    drawTerminalButton(rfFreqDownButton, "-", colors.amberDim, kButtonTextSize + 1);
+    drawTerminalButton(rfStepButton, stepLabel.c_str(), colors.amberDim, kButtonTextSize + 1);
+    drawTerminalButton(rfFreqUpButton, "+", colors.amberDim, kButtonTextSize + 1);
     lineY = static_cast<int16_t>(tuneY + tuneH + 6);
     int16_t volY = lineY;
-    int16_t volH = 44;
-    int16_t volButtonW = static_cast<int16_t>(min<int16_t>(112, max<int16_t>(72, screenW / 6)));
+    int16_t volH = 52;
+    int16_t volButtonW = static_cast<int16_t>(min<int16_t>(132, max<int16_t>(88, screenW / 6)));
     int16_t volGap = 8;
     rfVolumeDownButton = {12, volY, volButtonW, volH};
     rfVolumeUpButton = {static_cast<int16_t>(screenW - 12 - volButtonW), volY, volButtonW, volH};
@@ -23810,14 +23850,14 @@ void drawSdrAppScreen(uint8_t appIndex, const char *title) {
                        static_cast<int16_t>(rfVolumeUpButton.x - rfVolumeDownButton.x -
                                             rfVolumeDownButton.w - volGap * 2),
                        volH};
-    drawBtn(rfVolumeDownButton, "VOL -", colors.amberDim);
-    drawBtn(rfVolumeUpButton, "VOL +", colors.amberDim);
+    drawTerminalButton(rfVolumeDownButton, "VOL -", colors.amberDim, kButtonTextSize + 1);
+    drawTerminalButton(rfVolumeUpButton, "VOL +", colors.amberDim, kButtonTextSize + 1);
     M5.Display.fillRect(rfVolumeBarRect.x, rfVolumeBarRect.y, rfVolumeBarRect.w,
                         rfVolumeBarRect.h, colors.black);
     M5.Display.drawRect(rfVolumeBarRect.x, rfVolumeBarRect.y, rfVolumeBarRect.w,
                         rfVolumeBarRect.h, colors.amber);
     M5.Display.setTextDatum(MC_DATUM);
-    M5.Display.setTextSize(kSmallTextSize);
+    M5.Display.setTextSize(kButtonTextSize + 1);
     M5.Display.setTextColor(colors.amber, colors.black);
     M5.Display.drawString(String("RF VOL ") + String((rfAudioVolume * 100) / 255) + "%",
                           rfVolumeBarRect.x + rfVolumeBarRect.w / 2,
@@ -23825,12 +23865,13 @@ void drawSdrAppScreen(uint8_t appIndex, const char *title) {
     lineY = static_cast<int16_t>(volY + volH + 6);
     if (band.function == RF_FUNC_FM) {
       int16_t demodY = lineY;
-      int16_t demodH = 44;
+      int16_t demodH = 52;
       rfDemodDownButton = {0, 0, 0, 0};
       rfDemodParamButton = {0, 0, 0, 0};
       rfDemodUpButton = {0, 0, 0, 0};
       rfAudioSettingsButton = {12, demodY, static_cast<int16_t>(screenW - 24), demodH};
-      drawBtn(rfAudioSettingsButton, "RF AUDIO SETTINGS", colors.amberDim);
+      drawTerminalButton(rfAudioSettingsButton, "RF AUDIO SETTINGS", colors.amberDim,
+                         kButtonTextSize + 1);
       lineY = static_cast<int16_t>(demodY + demodH + 6);
     } else {
       rfDemodDownButton = {0, 0, 0, 0};
@@ -23839,10 +23880,13 @@ void drawSdrAppScreen(uint8_t appIndex, const char *title) {
       rfAudioSettingsButton = {0, 0, 0, 0};
     }
     setLivePanelTop(static_cast<int16_t>(lineY + 6));
-    drawBtn(appPrimaryButton, droneMode ? (rfScanRunning ? "STOP" : "MONITOR") : rfPrimaryLabel(),
-            colors.amber);
-    drawBtn(appSecondaryButton, "MODE", colors.amberDim);
-    drawBtn(appTertiaryButton, "BAND", colors.amberDim);
+    drawTerminalButton(appPrimaryButton,
+                       droneMode ? (rfScanRunning ? "STOP" : "MONITOR") : rfPrimaryLabel(),
+                       colors.amber, kButtonTextSize + 1);
+    drawTerminalButton(appSecondaryButton, "MODE", colors.amberDim,
+                       kButtonTextSize + 1);
+    drawTerminalButton(appTertiaryButton, "BAND", colors.amberDim,
+                       kButtonTextSize + 1);
     if (!droneMode && rfAudioSettingsOpen) drawRfAudioSettingsOverlay();
   } else if (appIndex == kAppRecorderIndex) {
     Rect statusPanel = {12, contentTop, static_cast<int16_t>(screenW - 24),
@@ -24077,13 +24121,16 @@ static bool drawMeshTextInputDelta(LoraView view) {
     M5.Display.drawRect(rect.x, rect.y, rect.w, rect.h, colors.amber);
     M5.Display.fillRect(static_cast<int16_t>(rect.x + 3), static_cast<int16_t>(rect.y + 3), 6,
                         static_cast<int16_t>(max<int16_t>(1, rect.h - 6)), colors.amber);
+    M5.Display.setTextSize(kButtonTextSize + 1);
+    M5.Display.setTextDatum(ML_DATUM);
     M5.Display.setTextColor(colors.amber, colors.black);
     M5.Display.drawString(trimToWidth(label, rect.w / 2 - 18), rect.x + 14,
-                          rect.y + (rect.h - M5.Display.fontHeight()) / 2);
+                          rect.y + rect.h / 2);
+    M5.Display.setTextSize(kSmallTextSize);
     M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.setTextDatum(TR_DATUM);
+    M5.Display.setTextDatum(MR_DATUM);
     M5.Display.drawString(trimToWidth(value, rect.w / 2 - 10), rect.x + rect.w - 8,
-                          rect.y + (rect.h - M5.Display.fontHeight()) / 2);
+                          rect.y + rect.h / 2);
     M5.Display.setTextDatum(TL_DATUM);
   };
 
@@ -24160,17 +24207,20 @@ void drawLoraApp() {
     M5.Display.fillRect(static_cast<int16_t>(rect.x + 3), static_cast<int16_t>(rect.y + 3), 6,
                         static_cast<int16_t>(max<int16_t>(1, rect.h - 6)),
                         selected ? colors.amber : colors.black);
+    M5.Display.setTextSize(kButtonTextSize + 1);
+    M5.Display.setTextDatum(ML_DATUM);
     M5.Display.setTextColor(colors.amber, bg);
     M5.Display.drawString(trimToWidth(label, rect.w / 2 - 18), rect.x + 14,
-                          rect.y + (rect.h - M5.Display.fontHeight()) / 2);
+                          rect.y + rect.h / 2);
+    M5.Display.setTextSize(kSmallTextSize);
     M5.Display.setTextColor(colors.amberDim, bg);
-    M5.Display.setTextDatum(TR_DATUM);
+    M5.Display.setTextDatum(MR_DATUM);
     M5.Display.drawString(trimToWidth(value, rect.w / 2 - 10), rect.x + rect.w - 8,
-                          rect.y + (rect.h - M5.Display.fontHeight()) / 2);
+                          rect.y + rect.h / 2);
     M5.Display.setTextDatum(TL_DATUM);
   };
   auto drawButton = [&](const Rect &rect, const char *label, uint16_t color) {
-    drawTerminalButton(rect, label, color);
+    drawTerminalButton(rect, label, color, kButtonTextSize + 1);
     M5.Display.setTextDatum(TL_DATUM);
     M5.Display.setTextSize(kSmallTextSize);
   };
@@ -24312,9 +24362,16 @@ void drawLoraApp() {
                       static_cast<int16_t>(screenW - 80), meshRowH};
       drawListRow(rowRect, fields[i], values[i], i == meshIdentityField);
     }
-    M5.Display.setTextColor(colors.amber, colors.black);
-    M5.Display.drawString(trimToWidth(String("Export: ") + meshExportText, screenW - 80),
-                          40, static_cast<int16_t>(contentBottom - lineH * 2));
+    String profileHint = "PROFILE EXPORT READY";
+    if (meshDeviceId.length()) {
+      profileHint += "  //  ID ";
+      profileHint += meshDeviceId.substring(0, min<int>(12, meshDeviceId.length()));
+      if (meshDeviceId.length() > 12) profileHint += "...";
+    }
+    M5.Display.setTextSize(kSmallTextSize);
+    M5.Display.setTextColor(colors.amberDim, colors.black);
+    M5.Display.drawString(trimToWidth(profileHint, screenW - 80), 40,
+                          static_cast<int16_t>(contentBottom - lineH));
   } else if (loraView == LORA_VIEW_RADIO) {
     int visible = max<int>(1, (contentBottom - contentTop - 10) / meshRowStep);
     int totalRows = static_cast<int>(kMeshNetworkPresetCount) + 1;
@@ -24512,65 +24569,71 @@ void drawLoraApp() {
     }
   }
 
-  if (loraView == LORA_VIEW_MESSAGES) {
-    drawButton(appPrimaryButton, "SEND", loraP2pConfigured ? colors.amber : colors.amberDim);
-    drawButton(appSecondaryButton, "MENU", colors.amberDim);
-    drawButton(appTertiaryButton, "CLEAR", colors.amberDim);
-  } else if (loraView == LORA_VIEW_MENU) {
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("Tap a row to select",
-                          appPrimaryButton.x, static_cast<int16_t>(appPrimaryButton.y + 10));
-  } else if (loraView == LORA_VIEW_IDENTITY) {
-    drawButton(appPrimaryButton, "SAVE", colors.amber);
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("Tap a field, tap Save to apply",
-                          appSecondaryButton.x, static_cast<int16_t>(appSecondaryButton.y + 10));
-  } else if (loraView == LORA_VIEW_RADIO) {
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("UP/DOWN SELECT  |  ENTER APPLY  |  ESC BACK",
-                          appPrimaryButton.x, static_cast<int16_t>(appPrimaryButton.y + 10));
-  } else if (loraView == LORA_VIEW_RADIO_EDIT) {
-    drawButton(appPrimaryButton, "SAVE", colors.amber);
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("Tap a field, type value, tap Save",
-                          appSecondaryButton.x, static_cast<int16_t>(appSecondaryButton.y + 10));
-  } else if (loraView == LORA_VIEW_POWER) {
-    drawButton(appPrimaryButton, "APPLY", colors.amber);
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("LEFT/RIGHT ADJUST  |  ENTER APPLY  |  ESC BACK",
-                          appSecondaryButton.x, static_cast<int16_t>(appSecondaryButton.y + 10));
-  } else if (loraView == LORA_VIEW_DISCOVER) {
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("LEFT/RIGHT CHANGES PANEL  /  ENTER SELECTS",
-                          appPrimaryButton.x, static_cast<int16_t>(appPrimaryButton.y + 10));
-  } else if (loraView == LORA_VIEW_CONTACTS) {
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("Tap contact once to select, again for chat",
-                          appPrimaryButton.x, static_cast<int16_t>(appPrimaryButton.y + 10));
-  } else if (loraView == LORA_VIEW_CONTACT_INFO) {
-    drawButton(appPrimaryButton, "TELEMETRY", colors.amber);
-    drawButton(appSecondaryButton,
-               (meshContactSelected >= 0 &&
-                meshContactSelected < static_cast<int>(meshContactCount) &&
-                meshContacts[meshContactSelected].showOnMap)
-                   ? "MAP ON"
-                   : "MAP OFF",
-               colors.amberDim);
-    drawButton(appTertiaryButton, "BACK", colors.amberDim);
-  } else if (loraView == LORA_VIEW_TELEMETRY) {
-    drawButton(appPrimaryButton, "REFRESH", colors.amber);
-    drawButton(appSecondaryButton,
-               (meshContactSelected >= 0 &&
-                meshContactSelected < static_cast<int>(meshContactCount) &&
-                meshContacts[meshContactSelected].showOnMap)
-                   ? "MAP ON"
-                   : "MAP OFF",
-               colors.amberDim);
-    drawButton(appTertiaryButton, "BACK", colors.amberDim);
-  } else {
-    M5.Display.setTextColor(colors.amberDim, colors.black);
-    M5.Display.drawString("Arrows select, Esc back",
-                          appPrimaryButton.x, static_cast<int16_t>(appPrimaryButton.y + 10));
+  if (!contentOnly || viewChanged) {
+    const int16_t footerRight = static_cast<int16_t>(appTertiaryButton.x + appTertiaryButton.w);
+    Rect footerAll = {appPrimaryButton.x, appPrimaryButton.y,
+                      static_cast<int16_t>(footerRight - appPrimaryButton.x),
+                      appPrimaryButton.h};
+    Rect footerAfterPrimary = {appSecondaryButton.x, appSecondaryButton.y,
+                               static_cast<int16_t>(footerRight - appSecondaryButton.x),
+                               appSecondaryButton.h};
+    M5.Display.fillRect(footerAll.x, footerAll.y, footerAll.w, footerAll.h, colors.black);
+    auto drawFooterHint = [&](const Rect &rect, const String &hint) {
+      drawTerminalPanel(rect, colors.amberDim);
+      M5.Display.setTextSize(kSmallTextSize);
+      M5.Display.setTextDatum(MC_DATUM);
+      M5.Display.setTextColor(colors.amberDim, colors.black);
+      M5.Display.drawString(trimToWidth(hint, rect.w - 20),
+                            rect.x + rect.w / 2, rect.y + rect.h / 2);
+      M5.Display.setTextDatum(TL_DATUM);
+    };
+
+    if (loraView == LORA_VIEW_MESSAGES) {
+      drawButton(appPrimaryButton, "SEND", loraP2pConfigured ? colors.amber : colors.amberDim);
+      drawButton(appSecondaryButton, "MENU", colors.amberDim);
+      drawButton(appTertiaryButton, "CLEAR", colors.amberDim);
+    } else if (loraView == LORA_VIEW_MENU) {
+      drawFooterHint(footerAll, "UP / DOWN SELECT   //   ENTER OPEN   //   ESC CHAT");
+    } else if (loraView == LORA_VIEW_IDENTITY) {
+      drawButton(appPrimaryButton, "SAVE", colors.amber);
+      drawFooterHint(footerAfterPrimary, "ARROWS SELECT   //   TYPE TO EDIT   //   ENTER SAVE");
+    } else if (loraView == LORA_VIEW_RADIO) {
+      drawFooterHint(footerAll, "UP / DOWN SELECT   //   ENTER APPLY   //   ESC BACK");
+    } else if (loraView == LORA_VIEW_RADIO_EDIT) {
+      drawButton(appPrimaryButton, "SAVE", colors.amber);
+      drawFooterHint(footerAfterPrimary, "ARROWS SELECT   //   TYPE VALUE   //   ENTER SAVE");
+    } else if (loraView == LORA_VIEW_POWER) {
+      drawButton(appPrimaryButton, "APPLY", colors.amber);
+      drawFooterHint(footerAfterPrimary,
+                     "UP / DOWN SELECT   //   LEFT / RIGHT CHANGE   //   ENTER APPLY");
+    } else if (loraView == LORA_VIEW_DISCOVER) {
+      drawFooterHint(footerAll,
+                     "LEFT / RIGHT PANEL   //   UP / DOWN SELECT   //   ENTER RUN");
+    } else if (loraView == LORA_VIEW_CONTACTS) {
+      drawFooterHint(footerAll, "UP / DOWN SELECT   //   ENTER DETAILS   //   ESC BACK");
+    } else if (loraView == LORA_VIEW_CONTACT_INFO) {
+      drawButton(appPrimaryButton, "TELEMETRY", colors.amber);
+      drawButton(appSecondaryButton,
+                 (meshContactSelected >= 0 &&
+                  meshContactSelected < static_cast<int>(meshContactCount) &&
+                  meshContacts[meshContactSelected].showOnMap)
+                     ? "MAP ON"
+                     : "MAP OFF",
+                 colors.amberDim);
+      drawButton(appTertiaryButton, "BACK", colors.amberDim);
+    } else if (loraView == LORA_VIEW_TELEMETRY) {
+      drawButton(appPrimaryButton, "REFRESH", colors.amber);
+      drawButton(appSecondaryButton,
+                 (meshContactSelected >= 0 &&
+                  meshContactSelected < static_cast<int>(meshContactCount) &&
+                  meshContacts[meshContactSelected].showOnMap)
+                     ? "MAP ON"
+                     : "MAP OFF",
+                 colors.amberDim);
+      drawButton(appTertiaryButton, "BACK", colors.amberDim);
+    } else {
+      drawFooterHint(footerAll, "UP / DOWN SELECT   //   ENTER OPEN   //   ESC BACK");
+    }
   }
   if (!contentOnly) {
     drawNavBar();
